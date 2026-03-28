@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "Proyecto1cc7 — Bare-Metal ARM OS",
+  "projectType": "general",
+  "projectName": "Proyecto1cc7 — Bare-Metal ARM OS",
+  "projectDescription": "A bare-metal preemptive operating system for ARM Cortex-A8 (BeagleBone Black / QEMU) featuring a round-robin scheduler, IRQ-driven context switching, and a minimal standard library.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#1E6B3C",
-    "light": "#D4EAD9",
-    "dark": "#0D3D20"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/Martin-ing/Proyecto1cc7"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/Martin-ing/Proyecto1cc7"
-    }
-  },
+  "primaryColor": "#1E6B3C",
+  "lightColor": "#D4EAD9",
+  "darkColor": "#0D3D20",
   "navigation": {
     "tabs": [
       {
@@ -62,7 +50,6 @@
               "library/stdio",
               "library/string",
               "library/alphanumeric",
-              "library/rand",
               "library/timer",
               "library/watchdog"
             ]
@@ -77,5 +64,27 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Preemptive round-robin scheduling via hardware timer IRQ",
+    "Full ARM Cortex-A8 context save/restore in assembly (IRQ and yield paths)",
+    "Dual-platform support: BeagleBone Black hardware and QEMU versatilepb emulator",
+    "Separate linker-defined memory regions per process (OS, P1, P2)",
+    "Minimal bare-metal standard library: PRINT/READ, string, float/int conversion",
+    "Watchdog timer disable on BeagleBone Black boot",
+    "UART0 serial I/O with platform-specific register abstraction"
+  ],
+  "publicApiSurface": [
+    "void process_init(Process *p, uint32_t pid, uint32_t pc, uint32_t sp)",
+    "void sched_enqueue(ProcessQueue *q, Process *p)",
+    "Process *sched_dequeue(ProcessQueue *q)",
+    "void schedule(void)",
+    "void yield(void)",
+    "void enable_irq(void) / void disable_irq(void)",
+    "void PRINT(const char *s, ...)",
+    "void READ(char *type, void *returnv)",
+    "void uart_putc(char c) / char uart_getc(void)",
+    "void timer_init(void) / void timer_irq_handler(void)",
+    "void watchdog_disable(void)"
+  ]
 }

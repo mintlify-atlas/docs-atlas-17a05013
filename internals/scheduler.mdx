@@ -1,0 +1,215 @@
+---
+title: "Round-robin scheduler"
+description: "The circular linked-list queue that drives fair process scheduling"
+---
+
+The scheduler uses a simple round-robin algorithm: every process in the ready queue receives one timer tick of CPU time. When the timer fires, the IRQ handler saves the current process's state, calls `schedule()`, and resumes whichever process is at the head of the queue.
+
+There is no priority, no aging, and no preemption other than the periodic timer IRQ.
+
+## ProcessQueue
+
+The queue is represented by a single struct defined in `scheduler.h`:
+
+```c scheduler.h
+typedef struct {
+    Process  *tail;
+    uint32_t  count;
+} ProcessQueue;
+```
+
+<ResponseField name="tail" type="Process *">
+  Points to the last node in the circular list. The head of the queue (the process that will run next) is always `tail->next`. `NULL` when the queue is empty.
+</ResponseField>
+
+<ResponseField name="count" type="uint32_t">
+  Number of processes currently in the queue.
+</ResponseField>
+
+The queue is stored as a single static global in `os.c`:
+
+```c os.c
+static ProcessQueue ready_queue;
+```
+
+## Scheduler API
+
+### sched_queue_init
+
+```c
+void sched_queue_init(ProcessQueue *q);
+```
+
+Initializes an empty queue by setting `tail` to `NULL` and `count` to `0`. Must be called before any other scheduler function.
+
+```c scheduler.c
+void sched_queue_init(ProcessQueue *q)
+{
+    q->tail  = NULL;
+    q->count = 0;
+}
+```
+
+---
+
+### sched_enqueue
+
+```c
+void sched_enqueue(ProcessQueue *q, Process *p);
+```
+
+Appends a process to the tail of the circular list.
+
+```c scheduler.c
+void sched_enqueue(ProcessQueue *q, Process *p)
+{
+    if (p == NULL) return;
+
+    if (q->tail == NULL) {
+        p->next = p;       // single node points to itself
+        q->tail = p;
+    } else {
+        p->next        = q->tail->next;   // new node points to current head
+        q->tail->next  = p;               // old tail points to new node
+        q->tail        = p;               // new node becomes tail
+    }
+
+    q->count++;
+}
+```
+
+When the queue is empty, the new node's `next` is set to itself — forming a one-element circular list. When the queue already has nodes, the new node is spliced between the current tail and the current head.
+
+---
+
+### sched_dequeue
+
+```c
+Process *sched_dequeue(ProcessQueue *q);
+```
+
+Removes and returns the process at the head of the queue (`tail->next`). Returns `NULL` if the queue is empty. Handles the single-element special case by setting `tail` to `NULL`.
+
+```c scheduler.c
+Process *sched_dequeue(ProcessQueue *q)
+{
+    Process *head;
+
+    if (q->tail == NULL) return NULL;
+
+    head = q->tail->next;
+
+    if (head == q->tail) {
+        q->tail = NULL;          // queue becomes empty
+    } else {
+        q->tail->next = head->next;
+    }
+
+    head->next = NULL;
+    q->count--;
+    return head;
+}
+```
+
+After dequeue, `head->next` is set to `NULL` to prevent stale pointer use.
+
+---
+
+### sched_peek
+
+```c
+Process *sched_peek(ProcessQueue *q);
+```
+
+Returns the process at the head of the queue without removing it. Returns `NULL` if the queue is empty. Useful for inspecting the next process to run without disturbing the queue state.
+
+```c scheduler.c
+Process *sched_peek(ProcessQueue *q)
+{
+    if (q->tail == NULL) return NULL;
+    return q->tail->next;
+}
+```
+
+---
+
+### sched_rotate
+
+```c
+void sched_rotate(ProcessQueue *q);
+```
+
+Advances `tail` to `tail->next`, effectively moving the current head to the tail position. This rotates the queue without a dequeue/enqueue pair. Only operates when the queue has at least two elements.
+
+```c scheduler.c
+void sched_rotate(ProcessQueue *q)
+{
+    if (q->tail == NULL || q->count < 2) return;
+    q->tail = q->tail->next;
+}
+```
+
+---
+
+### sched_is_empty
+
+```c
+int sched_is_empty(const ProcessQueue *q);
+```
+
+Returns non-zero if the queue is empty (`tail == NULL`), zero otherwise.
+
+```c scheduler.c
+int sched_is_empty(const ProcessQueue *q)
+{
+    return (q->tail == NULL);
+}
+```
+
+## Circular list structure
+
+The intrusive `next` pointer in each `Process` struct links the PCBs directly without any separate list node allocation. After enqueuing `p1` then `p2`, the structure is:
+
+```
+tail ──► p2
+          │
+          └─► p1 ──► p2 (wraps)
+```
+
+`tail->next` = head = `p1`. After one `sched_rotate`, `tail` moves to `p1` and the new head becomes `p2`.
+
+## The schedule() function
+
+`schedule()` in `os.c` is called from within the IRQ handler (via `root.s`) on every timer tick. It re-enqueues the current process and dequeues the next one:
+
+```c os.c
+void schedule(void)
+{
+    if (CurrProcess != NULL) {
+        CurrProcess->state = PROCESS_READY;
+        sched_enqueue(&ready_queue, CurrProcess);
+    }
+
+    CurrProcess = sched_dequeue(&ready_queue);
+
+    if (CurrProcess != NULL) {
+        CurrProcess->state = PROCESS_RUNNING;
+    }
+}
+```
+
+<Steps>
+  <Step title="Re-enqueue current process">
+    If `CurrProcess` is not `NULL`, its state is set to `PROCESS_READY` and it is appended to the tail of `ready_queue`. This gives every process a fair turn.
+  </Step>
+  <Step title="Dequeue next process">
+    The process at the head of the queue (`tail->next`) is removed and becomes the new `CurrProcess`.
+  </Step>
+  <Step title="Mark as running">
+    The newly dequeued process has its state set to `PROCESS_RUNNING`. The IRQ handler in `root.s` then restores its saved registers and resumes execution.
+  </Step>
+</Steps>
+
+<Note>
+  `schedule()` is called from assembly (`root.s`) inside `irq_handler` after the timer interrupt is acknowledged. At that point, the outgoing process's full register state has already been saved to its PCB, so re-enqueuing it is safe.
+</Note>

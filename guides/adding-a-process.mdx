@@ -1,0 +1,225 @@
+---
+title: "Adding a new process"
+description: "Step-by-step guide to adding a third user process to the round-robin scheduler"
+---
+
+This guide walks through every change needed to introduce a third user process (`P3`) alongside the existing `P1` and `P2`. The OS uses a circular linked-list queue (`ProcessQueue`) fed by `sched_enqueue` / `sched_dequeue`, so adding a process is a matter of registering memory regions, initialising a `Process` PCB, and enqueuing it before the scheduler starts.
+
+<Warning>
+  Process stacks must not overlap with any other memory region. Overlapping
+  stacks will silently corrupt register state during context switches, producing
+  non-deterministic behaviour that is very difficult to debug.
+</Warning>
+
+<Steps>
+
+<Step title="Create the process source file">
+
+Create `User/P3/main.c`. Model it on `User/P2/main.c`, which uses the same pattern: a named section attribute, a `disable_irq` / `enable_irq` critical section around the UART print, and an infinite loop.
+
+```c
+#include "stdio.h"
+#include "os.h"
+
+__attribute__((section(".p3_text")))
+void p3_start(void) {
+    int count = 0;
+    while (1) {
+        disable_irq();
+        PRINT("----From P3: %d\n", count++);
+        enable_irq();
+    }
+}
+```
+
+**Section attribute** — `__attribute__((section(".p3_text")))` tells the compiler to emit this function into the `.p3_text` output section instead of the default `.text` section. The linker script maps `.p3_text` to the `p3_ram` memory region (added in the next step), which places `p3_start` at the correct physical address independently of the OS code.
+
+**Critical section** — `disable_irq()` and `enable_irq()` clear and set the I-bit in the ARM CPSR respectively. The timer IRQ fires the `schedule()` function, which saves and restores the current process PCB. Wrapping the `PRINT` call prevents the scheduler from preempting the process mid-print, which would interleave UART output from multiple processes.
+
+</Step>
+
+<Step title="Update the linker scripts">
+
+Both linker scripts need a new memory region for `p3_ram` and `p3_stack`, and a new output section that places `.p3_text` into that region.
+
+**`linker/linker_beagle.ld`**
+
+Add the memory regions after the existing `p2_stack` entry:
+
+```text
+p3_ram   : ORIGIN = 0x82300000, LENGTH = 64K
+p3_stack : ORIGIN = 0x82310000, LENGTH = 4K
+```
+
+Then add the output section after the `.p2_text` block, following the same pattern used for P1 and P2:
+
+```text
+/* ====================================================== */
+/* P3 */
+/* ====================================================== */
+. = ORIGIN(p3_ram);
+
+.p3_text :
+{
+    __p3_start__ = .;
+    KEEP(*(.p3_text))
+    KEEP(*(.p3_rodata))
+    KEEP(*(.p3_data))
+    KEEP(*(.p3_bss))
+    __p3_end__ = .;
+} > p3_ram
+
+__p3_stack_base__ = ORIGIN(p3_stack);
+__p3_stack_top__  = ORIGIN(p3_stack) + LENGTH(p3_stack);
+```
+
+**`linker/linker_qemu.ld`**
+
+The QEMU address map starts at `0x00010000` for the OS. P1 is at `0x00060000` and P2 at `0x00080000`, so place P3 immediately after P2's stack:
+
+```text
+p3_ram   : ORIGIN = 0x000A0000, LENGTH = 64K
+p3_stack : ORIGIN = 0x000B0000, LENGTH = 4K
+```
+
+Then add the matching output section and symbols after the `.p2_bss` block:
+
+```text
+.p3_text :
+{
+    *(.p3_text*)
+    *(.p3_rodata*)
+} > p3_ram
+
+.p3_bss :
+{
+    *p3*(.bss*)
+} > p3_ram
+
+__p3_stack_base__ = ORIGIN(p3_stack);
+__p3_stack_top__  = ORIGIN(p3_stack) + LENGTH(p3_stack);
+```
+
+</Step>
+
+<Step title="Add platform defines to the .venv files">
+
+The `.venv` files are loaded by the Makefile (`include $(OS_DIR)/.venv.qemu` or `.venv.beagle`) and become C preprocessor defines via `PLATFORM_FLAGS`. Add the base address and stack address for P3 to both files.
+
+**`OS/.venv.beagle`** — append after the `P2_STACK` line:
+
+```text
+P3_BASE=0x82300000
+P3_STACK=0x82310000
+```
+
+**`OS/.venv.qemu`** — append after the `P2_STACK` line:
+
+```text
+P3_BASE=0x000A0000
+P3_STACK=0x000B0000
+```
+
+These values must match the `ORIGIN` values chosen for `p3_ram` and `p3_stack` in the corresponding linker script.
+
+</Step>
+
+<Step title="Update the Makefile PLATFORM_FLAGS">
+
+Open `Makefile` and extend the `PLATFORM_FLAGS` variable to pass the two new defines to the compiler. Add `-DP3_BASE` and `-DP3_STACK` after the existing `-DP2_STACK` line:
+
+```makefile
+PLATFORM_FLAGS = -DPLATFORM_TARGET=$(PLATFORM_TARGET) \
+                 -DPLATFORM_UART0_BASE=$(UART0_BASE) \
+                 -DPLATFORM_TIMER_BASE=$(TIMER_BASE) \
+                 -DPLATFORM_INTC_BASE=$(INTC_BASE) \
+                 -DPLATFORM_CM_PER_BASE=$(CM_PER_BASE) \
+                 -DPLATFORM_OS_BASE=$(OS_BASE) \
+                 -DPLATFORM_OS_STACK=$(OS_STACK) \
+                 -DP1_BASE=$(P1_BASE) \
+                 -DP1_STACK=$(P1_STACK) \
+                 -DP2_BASE=$(P2_BASE) \
+                 -DP2_STACK=$(P2_STACK) \
+                 -DP3_BASE=$(P3_BASE) \
+                 -DP3_STACK=$(P3_STACK)
+```
+
+</Step>
+
+<Step title="Initialise and enqueue P3 in os.c">
+
+Open `OS/os.c`. There are three changes:
+
+1. Declare a static `Process` for P3 alongside `p0`, `p1`, and `p2`.
+2. Call `process_init` to set up its PCB — `pc` is the base address of its text section and `sp` is the top of its stack.
+3. Call `sched_enqueue` to add it to the ready queue before the scheduler starts.
+
+```c
+static Process p0;
+static Process p1;
+static Process p2;
+static Process p3;          /* add this line */
+```
+
+Inside `main`, after the existing `process_init` calls:
+
+```c
+process_init(&p0, 0, PLATFORM_OS_BASE, PLATFORM_OS_STACK + PROCESS_STACK_SIZE);
+process_init(&p1, 1, P1_BASE, P1_STACK + PROCESS_STACK_SIZE);
+process_init(&p2, 2, P2_BASE, P2_STACK + PROCESS_STACK_SIZE);
+process_init(&p3, 3, P3_BASE, P3_STACK + PROCESS_STACK_SIZE);  /* add this line */
+```
+
+Then enqueue P3 so the scheduler can run it:
+
+```c
+sched_enqueue(&ready_queue, &p1);
+sched_enqueue(&ready_queue, &p2);
+sched_enqueue(&ready_queue, &p3);   /* add this line */
+```
+
+`process_init` (`OS/process.c`) zeroes the general-purpose registers, sets `spsr` to `0x00000013` (SVC mode, IRQs enabled), and stores `pc` and `sp` directly in the PCB. `PROCESS_STACK_SIZE` is `0x1000` (4 KB), so `sp` points to the top of the stack region, matching the `LENGTH = 4K` declared in the linker script.
+
+</Step>
+
+<Step title="Verify that the Makefile picks up the new source file automatically">
+
+The `C_SRC` variable in the Makefile uses a shell glob:
+
+```makefile
+C_SRC = $(wildcard $(PROGRAM_DIR)/**/*.c) \
+        $(wildcard $(OS_DIR)/*.c) \
+        $(wildcard $(LIB_DIR)/*.c)
+```
+
+`$(PROGRAM_DIR)` is `User`, so `User/**/*.c` matches `User/P1/main.c`, `User/P2/main.c`, **and** `User/P3/main.c` automatically. No Makefile change is needed for the source file itself. Build to confirm:
+
+```bash
+make TARGET=qemu
+```
+
+You should see output from all three processes interleaved on the console:
+
+```text
+----From OS: hola
+----From P1: 0
+----From P2: a
+----From P3: 0
+----From P1: 1
+----From P2: b
+----From P3: 1
+...
+```
+
+</Step>
+
+</Steps>
+
+<Note>
+  The maximum number of concurrent processes is limited by available RAM on the
+  target board. Each process requires at least one `LENGTH = 64K` code region
+  plus one `LENGTH = 4K` stack region in the linker script, plus a `Process`
+  struct (~80 bytes) in OS RAM. On the BeagleBone Black, the usable DDR3 range
+  starts at `0x80000000`; stay well below the top of physical memory and leave
+  headroom for the OS heap and BSS.
+</Note>

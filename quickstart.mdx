@@ -1,80 +1,252 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Build and run the bare-metal OS on QEMU or BeagleBone Black"
 ---
 
-## Get started in three steps
+## Prerequisites
 
-Get your documentation site running locally and make your first customization.
+Ensure the following tools are installed and available on your `PATH` before building:
 
-### Step 1: Set up your local environment
+| Tool | Purpose |
+|---|---|
+| `arm-none-eabi-gcc` | C compiler for ARM bare-metal targets |
+| `arm-none-eabi-as` | ARM assembler |
+| `arm-none-eabi-ld` | ARM linker |
+| `arm-none-eabi-objcopy` | ELF to raw binary conversion |
+| `qemu-system-arm` | ARM system emulator (QEMU target only) |
+| `gdb-multiarch` | Debugger with ARM support (optional, for GDB sessions) |
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+<Tip>
+  On Debian/Ubuntu: `sudo apt install gcc-arm-none-eabi binutils-arm-none-eabi qemu-system-arm gdb-multiarch`
+</Tip>
 
-### Step 2: Deploy your changes
+---
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+## Clone the repository
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+```bash
+git clone https://github.com/Martin-ing/Proyecto1cc7.git
+cd Proyecto1cc7
+```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+---
 
-### Step 3: Go live
+## Build
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+The build system reads platform-specific memory-map definitions from `.venv.qemu` or `.venv.beagle` at compile time and selects the matching linker script automatically.
 
-## Next steps
+<Tabs>
+  <Tab title="QEMU">
+    <Steps>
+      <Step title="Build for QEMU">
+        <CodeGroup>
+          ```bash make
+          make TARGET=qemu
+          # or use the shorthand target
+          make qemu
+          ```
 
-Now that you have your docs running, explore these key features:
+          ```bash build_and_run.sh
+          ./build_and_run.sh qemu
+          ```
+        </CodeGroup>
 
-<CardGroup cols={2}>
+        The QEMU build compiles with `-O0 -g3` (no optimisation, full debug info) and links against `linker/linker_qemu.ld`.
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+        **Key compiler flags applied by both methods:**
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+        | Flag | Description |
+        |---|---|
+        | `-mcpu=cortex-a8` | Target the Cortex-A8 core |
+        | `-mfpu=neon` | Enable the NEON FPU |
+        | `-mfloat-abi=hard` | Use hardware floating-point ABI |
+        | `-nostdlib -nostartfiles` | No standard library or C runtime startup |
+        | `-ffreestanding` | Freestanding (bare-metal) environment |
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+        **QEMU memory map** (from `OS/.venv.qemu`, enforced by `linker/linker_qemu.ld`):
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+        | Region | Base | Size |
+        |---|---|---|
+        | OS text/data/bss | `0x00010000` | 64 KB |
+        | Process 1 (P1) | `0x00060000` | 64 KB |
+        | P1 stack | `0x00070000` | 4 KB |
+        | Process 2 (P2) | `0x00080000` | 64 KB |
+        | P2 stack | `0x00090000` | 4 KB |
+        | UART0 | `0x101f1000` | — |
+        | Timer | `0x101e2000` | — |
+        | Interrupt controller | `0x10140000` | — |
+      </Step>
 
-</CardGroup>
+      <Step title="Verify output binaries">
+        Both methods produce the same artifacts under `bin/`:
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+        ```
+        bin/program.elf   ← ELF with debug symbols (used by QEMU -kernel and GDB)
+        bin/program.bin   ← Raw binary (used for flashing)
+        bin/program.map   ← Linker map (build_and_run.sh only)
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="BeagleBone Black">
+    <Steps>
+      <Step title="Build for BeagleBone Black">
+        <CodeGroup>
+          ```bash make
+          make TARGET=beagle
+          # or use the shorthand target
+          make beagle
+          ```
+
+          ```bash build_and_run.sh
+          ./build_and_run.sh beagle
+          ```
+        </CodeGroup>
+
+        The BeagleBone build compiles with `-O2` and links against `linker/linker_beagle.ld`.
+
+        **BeagleBone Black memory map** (from `OS/.venv.beagle`, enforced by `linker/linker_beagle.ld`):
+
+        | Region | Base | Size |
+        |---|---|---|
+        | OS text/data/bss | `0x82000000` | 256 KB |
+        | Process 1 (P1) | `0x82100000` | 64 KB |
+        | P1 stack | `0x82110000` | 4 KB |
+        | Process 2 (P2) | `0x82200000` | 64 KB |
+        | P2 stack | `0x82210000` | 4 KB |
+        | UART0 | `0x44E09000` | — |
+        | Timer | `0x48040000` | — |
+        | Interrupt controller | `0x48200000` | — |
+        | Clock/power manager | `0x44E00000` | — |
+      </Step>
+
+      <Step title="Verify output binaries">
+        ```
+        bin/program.elf   ← ELF image
+        bin/program.bin   ← Raw binary for U-Boot
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+---
+
+## Run
+
+<Tabs>
+  <Tab title="QEMU">
+    <Steps>
+      <Step title="Launch QEMU with a GDB server">
+        ```bash
+        qemu-system-arm \
+            -M versatilepb \
+            -cpu cortex-a8 \
+            -kernel bin/program.elf \
+            -nographic \
+            -S -s
+        ```
+
+        <Note>
+          `-S` halts the CPU at startup; `-s` opens a GDB server on `localhost:1234`. QEMU will wait silently until a debugger connects or you resume execution.
+        </Note>
+
+        `make qemu` runs this exact command automatically after a successful build.
+      </Step>
+
+      <Step title="Connect GDB (optional)">
+        In a second terminal:
+
+        ```bash
+        gdb-multiarch bin/program.elf
+        ```
+
+        Then inside GDB:
+
+        ```
+        set architecture arm
+        target remote :1234
+        file bin/program.elf
+        break main
+        continue
+        ```
+      </Step>
+
+      <Step title="Resume and observe UART output">
+        To run without halting (no GDB), omit the `-S -s` flags:
+
+        ```bash
+        qemu-system-arm -M versatilepb -cpu cortex-a8 -kernel bin/program.elf -nographic
+        ```
+
+        `build_and_run.sh qemu` uses this form — it builds and immediately launches QEMU without pausing.
+
+        The OS schedules two user processes in round-robin. Each prints to UART0. Expected output:
+
+        ```
+        ----From OS: hola
+        ----From P1: 0
+        ----From P2: a
+        ----From OS: hola
+        ----From P1: 1
+        ----From P2: b
+        ----From OS: hola
+        ----From P1: 2
+        ----From P2: c
+        ...
+        ```
+
+        <Tip>
+          Press `Ctrl+A` then `X` to exit QEMU when running with `-nographic`.
+        </Tip>
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="BeagleBone Black">
+    <Warning>
+      `build_and_run.sh beagle` does **not** flash or boot the board automatically. You must transfer `bin/program.bin` manually via U-Boot.
+    </Warning>
+
+    <Steps>
+      <Step title="Boot the board into U-Boot">
+        Connect a 3.3 V USB-to-serial adapter to the BeagleBone Black's UART0 debug header (J1) and open a serial terminal at **115200 8N1**. Power on the board and interrupt the U-Boot autoboot by pressing any key.
+      </Step>
+
+      <Step title="Transfer the binary">
+        Transfer `bin/program.bin` to the board. The most common method is TFTP — serve the file from your host and load it from U-Boot:
+
+        ```
+        setenv serverip 192.168.1.100
+        setenv ipaddr   192.168.1.200
+        tftp 0x82000000 program.bin
+        ```
+
+        <Note>
+          `0x82000000` matches `OS_BASE` in `OS/.venv.beagle` and `ORIGIN(os_ram)` in `linker/linker_beagle.ld`. The image must be loaded at this address.
+        </Note>
+      </Step>
+
+      <Step title="Boot the image">
+        ```
+        go 0x82000000
+        ```
+
+        U-Boot jumps to the OS entry point (`_start`) and begins execution. UART0 output appears on the same serial console.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+---
+
+## Clean
+
+Remove all build artifacts:
+
+```bash
+make clean
+```
+
+This deletes the entire `bin/` directory.

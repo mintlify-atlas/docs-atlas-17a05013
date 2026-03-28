@@ -1,0 +1,179 @@
+---
+title: "UART serial I/O"
+description: "Platform-abstracted UART0 driver for serial communication"
+---
+
+The UART driver provides the only output channel for the OS and user processes. All I/O is synchronous (polling) — no interrupt-driven buffering is used. The driver is abstracted over two hardware targets via a compile-time flag.
+
+## Platform abstraction
+
+The driver selects register definitions at compile time using the `PLATFORM_TARGET` preprocessor macro:
+
+```c uart.c
+#if PLATFORM_TARGET == 1
+    // QEMU PL011 UART
+#else
+    // BeagleBone Black TL16C750 UART
+#endif
+```
+
+`UART0_BASE` is defined by `plataform.h` as an alias for `PLATFORM_UART0_BASE`, which must be provided as a compile-time define (the header enforces this with `#error`).
+
+### QEMU PL011 register map
+
+When `PLATFORM_TARGET == 1`, the driver accesses the UART through a `volatile unsigned int *` pointer:
+
+```c uart.c
+#define UART_DR      0x00   // Data Register
+#define UART_FR      0x18   // Flag Register
+#define UART_FR_TXFF 0x20   // TX FIFO Full flag
+#define UART_FR_RXFE 0x10   // RX FIFO Empty flag
+
+volatile unsigned int * const UART0 = (unsigned int *)UART0_BASE;
+```
+
+| Register | Offset | Description |
+|---|---|---|
+| `UART_DR` | `0x00` | Read: received byte. Write: byte to transmit. |
+| `UART_FR` | `0x18` | Flag register. Poll to check FIFO status. |
+| `UART_FR_TXFF` | bit `0x20` | TX FIFO full — wait before writing. |
+| `UART_FR_RXFE` | bit `0x10` | RX FIFO empty — wait before reading. |
+
+### BeagleBone TL16C750 register map
+
+Without `PLATFORM_TARGET == 1`, the driver uses `PUT32`/`GET32` memory-mapped I/O helpers:
+
+```c uart.c
+#define UART_THR       (UART0_BASE + 0x00)  // Transmit Holding Register
+#define UART_LSR       (UART0_BASE + 0x14)  // Line Status Register
+#define UART_LSR_THRE  0x20                 // TX Holding Register Empty flag
+#define UART_LSR_RXFE  0x10                 // RX FIFO Empty flag
+```
+
+| Register | Offset | Description |
+|---|---|---|
+| `UART_THR` | `+0x00` | Write a byte here to transmit. Read to receive. |
+| `UART_LSR` | `+0x14` | Line Status Register. Poll for TX/RX readiness. |
+| `UART_LSR_THRE` | bit `0x20` | TX Holding Register Empty — safe to write. |
+| `UART_LSR_RXFE` | bit `0x10` | RX empty — no byte available yet. |
+
+## Public API
+
+### uart_putc
+
+```c
+void uart_putc(char c);
+```
+
+Transmits a single character. Blocks (busy-waits) until the transmit FIFO has space, then writes the character.
+
+```c uart.c
+void uart_putc(char c) {
+#if PLATFORM_TARGET == 1
+    while (UART0[UART_FR / 4] & UART_FR_TXFF);
+    UART0[UART_DR / 4] = c;
+#else
+    while ((GET32(UART_LSR) & UART_LSR_THRE) == 0);
+    PUT32(UART_THR, c);
+#endif
+}
+```
+
+---
+
+### uart_getc
+
+```c
+char uart_getc(void);
+```
+
+Receives a single character. Blocks until a byte is available in the receive FIFO, then returns it.
+
+```c uart.c
+char uart_getc(void) {
+#if PLATFORM_TARGET == 1
+    while (UART0[UART_FR / 4] & UART_FR_RXFE);
+    return (char)(UART0[UART_DR / 4] & 0xFF);
+#else
+    while ((GET32(UART_LSR) & UART_LSR_RXFE) != 0);
+    return (char)(GET32(UART_THR) & 0xFF);
+#endif
+}
+```
+
+---
+
+### os_write / uart_puts
+
+```c
+void os_write(const char *s);
+void uart_puts(const char *s);
+```
+
+Transmits a null-terminated string by calling `uart_putc()` for each character. `uart_puts` is an alias for `os_write`.
+
+```c uart.c
+void os_write(const char *s) {
+    while (*s) {
+        uart_putc(*s++);
+    }
+}
+
+void uart_puts(const char *s) {
+    os_write(s);
+}
+```
+
+---
+
+### os_read / uart_gets_input
+
+```c
+void os_read(char *buffer, int max_length);
+void uart_gets_input(char *buffer, int max_length);
+```
+
+Reads a line of input from the UART into `buffer`. Characters are echoed back as they are received. Reading stops when a newline (`\n`) or carriage return (`\r`) is received, or when `max_length - 1` characters have been stored. The buffer is always null-terminated. `uart_gets_input` is an alias for `os_read`.
+
+```c uart.c
+void os_read(char *buffer, int max_length) {
+    int i = 0;
+    char c;
+
+    while (i < max_length - 1) {
+        c = uart_getc();
+
+        if (c == '\n' || c == '\r') {
+            uart_putc('\n');
+            break;
+        }
+
+        uart_putc(c);      // echo
+        buffer[i++] = c;
+    }
+
+    buffer[i] = '\0';
+}
+
+void uart_gets_input(char *buffer, int max_length) {
+    os_read(buffer, max_length);
+}
+```
+
+<Note>
+  The UART driver is entirely polling-based. Every call to `uart_putc()` or `uart_getc()` spins in a tight loop until the hardware is ready. There are no receive or transmit interrupts, no DMA, and no ring buffers. Output is strictly synchronous.
+</Note>
+
+## Usage in the OS
+
+The OS main loop wraps `os_write` (aliased as `PRINT`) in a critical section to prevent the scheduler from preempting mid-output:
+
+```c os.c
+while (1) {
+    disable_irq();
+    PRINT("----From OS: hola\n");
+    enable_irq();
+}
+```
+
+Because `uart_putc` busy-waits, a preemption mid-transmission would leave the UART in a partially-written state visible to the new process's output. Disabling IRQs for the duration of each print call prevents interleaved output across processes.

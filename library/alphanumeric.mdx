@@ -1,0 +1,122 @@
+---
+title: "alphanumeric — numeric conversion"
+description: "Integer and float conversion to/from strings for UART I/O"
+---
+
+`alphanumeric` provides printf-like numeric formatting and scanf-like numeric parsing without any libc dependency. It is the bridge between the UART byte stream and the typed values that `PRINT` and `READ` expose to user processes.
+
+All conversion functions use fixed-size stack buffers of 16 bytes. No heap allocation is performed.
+
+## Functions
+
+### uart_putnum
+
+```c
+void uart_putnum(unsigned int num);
+```
+
+Prints an unsigned integer directly to UART followed by a newline (`\n`). Uses a 16-byte stack buffer and builds the digit string in reverse before sending. If `num` is `0`, outputs `"0\n"` immediately.
+
+```c
+uart_putnum(42);   // outputs "42\n"
+uart_putnum(0);    // outputs "0\n"
+```
+
+---
+
+### uart_itoa
+
+```c
+void uart_itoa(int num, char *buffer);
+```
+
+Converts a signed integer to its decimal string representation and stores the result in `buffer`. The buffer must be at least 16 bytes. The output is null-terminated.
+
+Handles negative numbers by prepending `'-'`. Builds digits in reverse internally, then reverses the buffer in place.
+
+| Input | Output in buffer |
+|-------|-----------------|
+| `0` | `"0"` |
+| `42` | `"42"` |
+| `-7` | `"-7"` |
+
+```c
+char buf[16];
+uart_itoa(-123, buf);
+uart_puts(buf);   // outputs "-123"
+```
+
+---
+
+### uart_ftoa
+
+```c
+void uart_ftoa(float num, char *buffer);
+```
+
+Converts a `float` to its decimal string representation and stores the result in `buffer`. The buffer must be at least 16 bytes. The output is null-terminated and includes a decimal point.
+
+The implementation separates the integer and fractional parts. The fractional part is expanded by repeated multiplication by 10 until it has no remaining fractional component (i.e., the loop `while (decpart - (float)((int)decpart))` terminates when the decimal is exact in floating point). This means precision depends on whether the fractional value is exactly representable.
+
+```c
+char buf[16];
+uart_ftoa(3.14f, buf);
+uart_puts(buf);   // outputs "3.14"
+```
+
+<Note>
+The precision of `uart_ftoa` is limited by floating-point representation. Values whose fractional parts cannot be expressed exactly in IEEE 754 single precision may produce unexpected digit sequences.
+</Note>
+
+---
+
+### uart_atoi
+
+```c
+int uart_atoi(const char *s);
+```
+
+Parses a decimal integer string and returns the `int` value. Handles an optional leading `'-'` for negative numbers. Stops at the first non-digit character.
+
+```c
+int v = uart_atoi("42");    // 42
+int w = uart_atoi("-10");   // -10
+```
+
+---
+
+### uart_atof
+
+```c
+float uart_atof(const char *s);
+```
+
+Parses a decimal floating-point string and returns the `float` value. Handles an optional leading `'-'` and a single `'.'` as the decimal separator. Stops at the first character that is neither a digit nor a period.
+
+```c
+float f = uart_atof("3.14");   // 3.14f
+float g = uart_atof("-0.5");   // -0.5f
+```
+
+## How PRINT uses these functions
+
+`PRINT` in `stdio.c` calls `uart_itoa` and `uart_ftoa` to convert numeric arguments into stack-allocated strings, then passes those strings to `uart_puts`:
+
+```c
+// %d path
+int v = va_arg(args, int);
+uart_itoa(v, buffer);
+uart_puts(buffer);
+
+// %f path — float is promoted to double in varargs
+double v = va_arg(args, double);
+uart_ftoa((float)v, buffer);
+uart_puts(buffer);
+```
+
+`READ` uses `uart_atoi` and `uart_atof` to parse the 16-character UART input buffer back into typed values:
+
+```c
+*(int *)   returnv = uart_atoi(input);   // "%d"
+*(float *) returnv = uart_atof(input);   // "%f"
+```

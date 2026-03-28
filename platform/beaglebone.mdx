@@ -1,0 +1,220 @@
+---
+title: "BeagleBone Black"
+description: "Building and deploying the OS on real BeagleBone Black hardware"
+---
+
+Set `PLATFORM_TARGET=0` to target BeagleBone Black hardware. This is the default when no `TARGET` is specified.
+
+## Hardware peripherals
+
+The following memory-mapped peripherals are used on BeagleBone Black:
+
+| Peripheral | Address | Description |
+|---|---|---|
+| UART0 | `0x44E09000` | TL16C750-compatible serial port |
+| DMTIMER2 | `0x48040000` | General-purpose timer |
+| INTCPS | `0x48200000` | ARM interrupt controller |
+| CM\_PER | `0x44E00000` | Clock Manager (peripheral clocks) |
+| WDT1 | `0x44E35000` | Hardware watchdog timer |
+
+## Memory layout
+
+The linker script `linker/linker_beagle.ld` places the OS and both user processes in DDR RAM above `0x82000000`:
+
+| Region | Origin | Size |
+|---|---|---|
+| `os_ram` | `0x82000000` | 256K |
+| `p1_ram` | `0x82100000` | 64K |
+| `p1_stack` | `0x82110000` | 4K |
+| `p2_ram` | `0x82200000` | 64K |
+| `p2_stack` | `0x82210000` | 4K |
+
+```ld linker/linker_beagle.ld
+MEMORY
+{
+    os_ram   : ORIGIN = 0x82000000, LENGTH = 256K
+
+    p1_ram   : ORIGIN = 0x82100000, LENGTH = 64K
+    p1_stack : ORIGIN = 0x82110000, LENGTH = 4K
+
+    p2_ram   : ORIGIN = 0x82200000, LENGTH = 64K
+    p2_stack : ORIGIN = 0x82210000, LENGTH = 4K
+}
+```
+
+The OS stack bottom begins at `__bss_end__` and the stack top is the end of `os_ram` (`0x82040000`).
+
+## Building
+
+<Steps>
+  <Step title="Build for BeagleBone Black">
+    Run either of the following commands from the project root:
+
+    ```bash
+    make TARGET=beagle
+    ```
+
+    or use the convenience alias:
+
+    ```bash
+    make beagle
+    ```
+
+    The Makefile defaults to `TARGET=beagle` when no target is specified, so a bare `make` also works.
+  </Step>
+  <Step title="Locate the output files">
+    After a successful build, two output files are produced inside `bin/`:
+
+    | File | Description |
+    |---|---|
+    | `bin/program.elf` | ELF image with debug symbols (for GDB / `bootelf`) |
+    | `bin/program.bin` | Raw binary image (for `go` / `fatload`) |
+
+    The BeagleBone build compiles with `-O2` and no debug info.
+  </Step>
+</Steps>
+
+## Deploying with U-Boot
+
+U-Boot is the typical first-stage bootloader on BeagleBone Black. Two common methods to load the OS image are shown below.
+
+<Tabs>
+  <Tab title="fatload (SD card)">
+    Copy `bin/program.bin` to the FAT partition of your SD card, then at the U-Boot prompt:
+
+    ```text
+    fatload mmc 0:1 0x82000000 program.bin
+    go 0x82000000
+    ```
+
+    `go` jumps directly to the raw binary entry point. Use this when loading `program.bin`.
+  </Tab>
+  <Tab title="tftp (network)">
+    Configure your TFTP server to serve `program.bin`, then at the U-Boot prompt:
+
+    ```text
+    setenv serverip 192.168.1.1
+    setenv ipaddr   192.168.1.100
+    tftp 0x82000000 program.bin
+    go 0x82000000
+    ```
+  </Tab>
+  <Tab title="bootelf (ELF)">
+    If you transfer the ELF file instead:
+
+    ```text
+    fatload mmc 0:1 0x82000000 program.elf
+    bootelf 0x82000000
+    ```
+
+    `bootelf` reads the ELF headers to find the entry point automatically.
+  </Tab>
+</Tabs>
+
+<Note>
+  The OS entry point is `_start`, defined in `OS/root.s`. All load addresses above must match `os_ram` origin `0x82000000`.
+</Note>
+
+## Watchdog
+
+BeagleBone Black's hardware watchdog (WDT1) starts counting down at power-on by default. If the OS does not disable it, the board resets after the watchdog period expires.
+
+`watchdog_disable()` in `OS/watchdog.c` sends the two-step magic sequence to the Watchdog Write Sequence and Pending Register:
+
+```c OS/watchdog.c
+#define WDT1_BASE   0x44E35000
+#define WDT_WSPR    (WDT1_BASE + 0x48)
+#define WDT_WWPS    (WDT1_BASE + 0x34)
+
+void watchdog_disable(void) {
+    #if PLATFORM_TARGET == 0
+        PUT32(WDT_WSPR, 0xAAAA);
+        while (GET32(WDT_WWPS) & (1 << 4));
+        PUT32(WDT_WSPR, 0x5555);
+        while (GET32(WDT_WWPS) & (1 << 4));
+    #endif
+}
+```
+
+The write-pending bit (bit 4 of `WWPS`) must clear between each step. This function is a no-op when compiled for QEMU (`PLATFORM_TARGET == 1`).
+
+<Warning>
+  Call `watchdog_disable()` early in your boot sequence. If it is not called, the hardware watchdog will reset the board before the OS finishes initializing.
+</Warning>
+
+## DMTIMER2 clock and timer
+
+### Enabling the clock
+
+DMTIMER2 requires its functional clock to be enabled through the Clock Manager before use. The Makefile passes `CM_PER_BASE=0x44E00000`, and `timer.c` derives:
+
+```c Lib/timer.c
+#define CM_PER_TIMER2_CLKCTRL   (CM_PER_BASE + 0x80)
+```
+
+During `timer_init()`, the clock is enabled first:
+
+```c Lib/timer.c
+// Enable timer2 clock
+PUT32(CM_PER_TIMER2_CLKCTRL, 0x2);
+```
+
+### Timer configuration
+
+The timer runs at 24 MHz on BeagleBone Black. The load register value is calculated to produce approximately a 2-second overflow period:
+
+```c Lib/timer.c
+#define FREQ_BEAGLE   0xFFFFFFFF - (24000000 * 2)
+```
+
+The full `timer_init()` sequence for BeagleBone Black:
+
+```c Lib/timer.c
+// Unmask interrupt 68 and give it priority
+PUT32(INTC_MIR_CLEAR2, (1 << 4));
+PUT32(INTC_ILR68, 0x0);
+
+// Stop timer and clear pending flags
+PUT32(TCLR, 0x0);
+PUT32(TISR, 0x7);
+
+// Load start value for ~2 seconds at 24 MHz
+PUT32(TLDR, FREQ_BEAGLE);
+PUT32(TCRR, FREQ_BEAGLE);
+
+// Enable overflow interrupt and auto-reload
+PUT32(TIER, 0x2);
+PUT32(TCLR, 0x3);
+```
+
+DMTIMER2 register offsets from `DMTIMER2_BASE` (`0x48040000`):
+
+| Macro | Offset | Description |
+|---|---|---|
+| `TISR` | `+0x28` | Interrupt Status Register |
+| `TIER` | `+0x2C` | Interrupt Enable Register |
+| `TCLR` | `+0x38` | Timer Control Register |
+| `TCRR` | `+0x3C` | Timer Counter Register |
+| `TLDR` | `+0x40` | Timer Load Register |
+
+## Environment file
+
+The `.venv.beagle` file defines all platform addresses loaded by the Makefile when `TARGET=beagle`:
+
+```bash OS/.venv.beagle
+PLATFORM_TARGET=0
+
+OS_BASE=0x82000000
+OS_STACK=0x82010000
+
+P1_BASE=0x82100000
+P1_STACK=0x82110000
+
+P2_BASE=0x82200000
+P2_STACK=0x82210000
+
+UART0_BASE=0x44E09000
+TIMER_BASE=0x48040000
+INTC_BASE=0x48200000
+CM_PER_BASE=0x44E00000
+```

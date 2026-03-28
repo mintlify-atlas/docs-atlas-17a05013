@@ -1,0 +1,68 @@
+---
+title: "Introduction"
+description: "A bare-metal preemptive operating system for ARM Cortex-A8, targeting BeagleBone Black hardware and QEMU emulation."
+---
+
+## What is Proyecto1cc7?
+
+Proyecto1cc7 is an educational bare-metal operating system written in C and ARM assembly, designed to run directly on ARM Cortex-A8 hardware (BeagleBone Black) and in QEMU emulation (`versatilepb` machine). It implements the core primitives of a real-time OS from scratch — no Linux, no RTOS, no libc.
+
+The OS demonstrates:
+
+- **Preemptive multitasking** — a hardware timer fires IRQs that trigger context switches between processes
+- **Round-robin scheduling** — a circular queue ensures each process gets CPU time fairly
+- **Full register save/restore** — all ARM banked registers (SP, LR, SPSR) are saved and restored correctly on every context switch
+- **Dual-platform support** — the same codebase targets both real BeagleBone Black hardware and QEMU, selected at compile time via `TARGET`
+- **Minimal standard library** — `PRINT`/`READ`, string utilities, and numeric conversion run without any OS or libc dependency
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build and run the OS in QEMU in under five minutes
+  </Card>
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture/overview">
+    Understand how the OS components fit together
+  </Card>
+  <Card title="OS internals" icon="microchip" href="/internals/process-management">
+    Deep dive into process management and scheduling
+  </Card>
+  <Card title="Platform support" icon="server" href="/platform/beaglebone">
+    Configure for BeagleBone Black or QEMU
+  </Card>
+</CardGroup>
+
+## Project structure
+
+```
+Proyecto1cc7/
+├── OS/           # Kernel: scheduler, process, UART, timer, watchdog
+│   ├── root.s    # ARM assembly: vector table, IRQ handler, yield, boot
+│   ├── os.c      # main(), schedule(), process init
+│   ├── process.c # Process struct and initialization
+│   ├── scheduler.c # Round-robin queue operations
+│   ├── uart.c    # UART0 serial I/O (platform-abstracted)
+│   └── watchdog.c # BeagleBone watchdog disable
+├── Lib/          # Minimal standard library
+│   ├── stdio.c   # PRINT() / READ() — printf-like over UART
+│   ├── string.c  # my_strncpy — bounded string copy
+│   ├── alphanumeric.c # itoa, ftoa, atoi, atof
+│   ├── rand.c    # rand_custom() / srand_custom() — LCG PRNG
+│   └── timer.c   # Timer driver (BeagleBone DMTIMER2 / QEMU SP804)
+├── User/         # User-space processes
+│   ├── P1/main.c # Process 1: prints a counter
+│   └── P2/main.c # Process 2: prints letters a–z
+├── linker/       # Platform linker scripts
+│   ├── linker_beagle.ld
+│   └── linker_qemu.ld
+└── Makefile      # Build system (TARGET=beagle|qemu)
+```
+
+## Key concepts
+
+| Concept | Implementation |
+|---|---|
+| Process control block | `Process` struct in `OS/process.h` |
+| Ready queue | Circular linked list in `OS/scheduler.c` |
+| Context switch | ARM assembly in `OS/root.s` (`irq_handler`, `yield`) |
+| Timer interrupt | BeagleBone DMTIMER2 or QEMU SP804 in `Lib/timer.c` |
+| Serial output | UART0 with platform register abstraction in `OS/uart.c` |
+| Memory layout | Linker scripts assigning separate RAM regions per process |

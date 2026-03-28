@@ -1,0 +1,241 @@
+---
+title: "Context switching"
+description: "How ARM registers are saved and restored on every preemptive switch"
+---
+
+Every context switch saves and restores the complete CPU state of a process. That state consists of:
+
+- General-purpose registers **r0–r12** (13 registers, shared across modes)
+- **SP** — the banked SVC-mode stack pointer (`sp_svc`)
+- **LR** — the banked SVC-mode link register (`lr_svc`)
+- **PC** — the next instruction to execute
+- **SPSR** — the saved CPSR (processor mode, flags, interrupt mask) of the interrupted process
+
+All of these fields map directly to members of the `Process` PCB struct.
+
+## ARM banked registers
+
+ARM Cortex-A cores bank certain registers per processor mode. IRQ mode has its own private `sp_irq` and `lr_irq` that are invisible when the CPU runs in SVC mode, and vice versa. Registers r0–r12 are **shared** across all modes. This property is exploited during the context switch: r0–r12 are read from the IRQ stack (where they were pushed at handler entry), then the CPU switches temporarily to SVC mode to access the process's banked `sp_svc` and `lr_svc`.
+
+## Preemptive IRQ-driven context switch
+
+The full switch is implemented in `irq_handler` in `root.s`. It executes in 12 distinct stages:
+
+<Steps>
+  <Step title="Save r0–r12 and LR on the IRQ stack">
+
+```armasm root.s
+sub  sp, sp, #56
+stmia sp, {r0-r12, lr}
+```
+
+The IRQ stack pointer is decremented by 56 bytes (14 registers × 4 bytes). `r0–r12` and `lr_irq` are stored contiguously. `lr_irq` holds `PC_interrupted + 4` (ARM IRQ pipeline behaviour).
+
+  </Step>
+  <Step title="Load the CurrProcess pointer">
+
+```armasm root.s
+ldr  r4, =CurrProcess
+ldr  r4, [r4]
+
+cmp  r4, #0
+beq  irq_no_current_process
+```
+
+The address of the `CurrProcess` global is loaded, then dereferenced to obtain the PCB pointer. If it is `NULL` the register-save block is skipped (safety guard).
+
+  </Step>
+  <Step title="Copy r0–r12 from IRQ stack into PCB">
+
+```armasm root.s
+ldr  r5, [sp, #0]
+str  r5, [r4, #PROC_R0]
+ldr  r5, [sp, #4]
+str  r5, [r4, #PROC_R1]
+@ ... repeated for r2–r12
+ldr  r5, [sp, #48]
+str  r5, [r4, #PROC_R12]
+```
+
+Because r0–r12 were overwritten by the handler's own setup, the original values are recovered from the IRQ stack and written into the `r[]` array in the PCB.
+
+  </Step>
+  <Step title="Save SPSR into PCB">
+
+```armasm root.s
+mrs  r5, spsr
+str  r5, [r4, #PROC_SPSR]
+```
+
+`spsr_irq` contains the CPSR that was automatically saved by hardware when the IRQ was taken. It reflects the mode and flags of the interrupted process.
+
+  </Step>
+  <Step title="Compute and save the interrupted PC">
+
+```armasm root.s
+ldr  r5, [sp, #52]      @ lr_irq from the stack
+sub  r5, r5, #4
+str  r5, [r4, #PROC_PC]
+```
+
+The ARM IRQ pipeline sets `lr_irq = PC_interrupted + 4`. Subtracting 4 recovers the actual next instruction. That corrected value is written to `PCB.pc`.
+
+  </Step>
+  <Step title="Switch to SVC mode and save sp_svc / lr_svc">
+
+```armasm root.s
+mrs  r6, cpsr           @ save IRQ CPSR
+
+bic  r7, r6, #0x1F
+orr  r7, r7, #0x13      @ SVC mode bits
+orr  r7, r7, #0x80      @ keep IRQ disabled
+msr  cpsr_c, r7
+
+str  sp, [r4, #PROC_SP] @ sp_svc of the process
+str  lr, [r4, #PROC_LR] @ lr_svc of the process
+
+msr  cpsr_c, r6         @ return to IRQ mode
+```
+
+Because `sp_svc` and `lr_svc` are banked, they are only visible while in SVC mode. The CPU mode is switched momentarily, the two registers are stored into the PCB, then IRQ mode is restored.
+
+  </Step>
+  <Step title="Acknowledge the timer interrupt">
+
+```armasm root.s
+irq_no_current_process:
+    bl   timer_irq_handler
+```
+
+The timer's interrupt-status register is cleared so the interrupt line de-asserts and the same IRQ is not immediately re-taken.
+
+  </Step>
+  <Step title="Call schedule() to select the next process">
+
+```armasm root.s
+bl   schedule
+```
+
+`schedule()` re-enqueues the current process and dequeues the next one, updating the `CurrProcess` global.
+
+  </Step>
+  <Step title="Load the new CurrProcess pointer">
+
+```armasm root.s
+ldr  r4, =CurrProcess
+ldr  r4, [r4]
+```
+
+After `schedule()` returns, `CurrProcess` points to the newly selected process. Its PCB is loaded into `r4`.
+
+  </Step>
+  <Step title="Set lr_irq to the new process's PC and restore SPSR">
+
+```armasm root.s
+ldr  lr, [r4, #PROC_PC]
+
+ldr  r5, [r4, #PROC_SPSR]
+msr  spsr_cxsf, r5
+```
+
+`lr_irq` (the banked IRQ link register) is set to the new process's saved PC. `spsr_irq` is loaded with the new process's saved CPSR so that `movs pc, lr` restores the correct processor mode atomically.
+
+  </Step>
+  <Step title="Switch to SVC to restore sp_svc and lr_svc, then return to IRQ">
+
+```armasm root.s
+mrs  r6, cpsr
+bic  r7, r6, #0x1F
+orr  r7, r7, #0x13
+orr  r7, r7, #0x80
+msr  cpsr_c, r7
+
+ldr  sp, [r4, #PROC_SP]   @ restore sp_svc
+ldr  lr, [r4, #PROC_LR]   @ restore lr_svc
+
+msr  cpsr_c, r6            @ back to IRQ mode
+```
+
+The banked SVC registers are written from the new process's PCB. `lr_irq` is not disturbed because it is a separate banked register.
+
+  </Step>
+  <Step title="Restore r0–r12 and atomically jump to the new process">
+
+```armasm root.s
+add  r4, r4, #PROC_R0
+ldmia r4, {r0-r12}
+
+movs pc, lr
+```
+
+`r4` is advanced to the start of the `r[]` array in the PCB and `ldmia` loads all 13 registers in one instruction (overwriting `r4` with its correct saved value in the process). Finally, `movs pc, lr` simultaneously sets **PC** to `lr_irq` (the new process's entry point) and restores **CPSR** from `spsr_irq` (the new process's saved flags and mode).
+
+  </Step>
+</Steps>
+
+## The movs pc, lr trick
+
+`movs pc, lr` is a privileged-mode data-processing instruction with the S-bit set. In privileged modes, the S-bit on a PC-write causes the processor to copy `SPSR` into `CPSR`. This makes the operation atomic: the new PC and the new CPSR are applied in a single cycle, with no window where the processor is in a partially-restored state.
+
+<Note>
+  On ARMv7-A this idiom is architecturally valid only in privileged modes (SVC, IRQ, FIQ, etc.). User-mode code must use a different return sequence.
+</Note>
+
+## Voluntary context switch: yield()
+
+`yield()` allows a process to voluntarily surrender the CPU from SVC mode without waiting for the next timer tick. The save sequence mirrors the IRQ handler but does not need to read banked IRQ registers:
+
+```armasm root.s
+yield:
+    push {r0-r12, lr}
+
+    ldr  r4, =CurrProcess
+    ldr  r4, [r4]
+
+    cmp  r4, #0
+    beq  yield_no_process
+
+    @ Save r0-r12 from the SVC stack
+    ldr  r5, [sp, #0]
+    str  r5, [r4, #PROC_R0]
+    @ ... r1–r12 similarly ...
+    ldr  r5, [sp, #48]
+    str  r5, [r4, #PROC_R12]
+
+    @ Save PC and LR (both from the pushed lr on the stack)
+    ldr  r5, [sp, #52]
+    str  r5, [r4, #PROC_PC]
+    str  r5, [r4, #PROC_LR]
+
+    @ Save SP (stack pointer before the push = sp + 56)
+    add  r5, sp, #56
+    str  r5, [r4, #PROC_SP]
+
+    @ Save CPSR as SPSR
+    mrs  r5, cpsr
+    str  r5, [r4, #PROC_SPSR]
+
+yield_no_process:
+    bl   schedule
+
+    ldr  r4, =CurrProcess
+    ldr  r4, [r4]
+
+    ldr  lr,  [r4, #PROC_PC]
+    ldr  r5,  [r4, #PROC_SPSR]
+    msr  spsr_cxsf, r5
+
+    ldr  sp,  [r4, #PROC_SP]
+
+    add  r4, r4, #PROC_R0
+    ldmia r4, {r0-r12}
+
+    movs pc, lr
+```
+
+Key differences from the IRQ path:
+
+- Registers are pushed onto the **SVC** stack (no mode switch needed to read them).
+- The saved PC is taken from the pushed `lr` value, which is the return address from the `bl yield` call site — no `- 4` adjustment is needed.
+- `CPSR` is saved directly as the process's SPSR (no separate `spsr_irq` involved).
+- The restore path does not need to touch `lr_irq` because there is no IRQ bank in play; `movs pc, lr` still works identically to restore CPSR from `spsr_cxsf`.

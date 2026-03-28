@@ -1,97 +1,51 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Proyecto1cc7 — Bare-Metal ARM OS"
+description: "A preemptive operating system for ARM Cortex-A8, built from scratch in C and assembly. Runs on BeagleBone Black hardware and QEMU emulation."
 ---
 
-## Setting up
+A minimal, educational bare-metal OS targeting the ARM Cortex-A8. It implements preemptive round-robin scheduling, hardware IRQ-driven context switching, and a no-libc standard library — all from scratch.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build and run the OS in QEMU in under five minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="diagram-project" href="/architecture/overview">
+    How the kernel, scheduler, and processes fit together
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="OS Internals" icon="microchip" href="/internals/process-management">
+    Process management, scheduling, and context switching
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Platform Support" icon="server" href="/platform/beaglebone">
+    Configure for BeagleBone Black or QEMU
   </Card>
-</Columns>
+  <Card title="Library Reference" icon="book" href="/library/stdio">
+    PRINT, READ, string, and numeric utilities
+  </Card>
+  <Card title="Add a Process" icon="plus" href="/guides/adding-a-process">
+    Step-by-step guide to adding your own user process
+  </Card>
+</CardGroup>
 
-## Create beautiful pages
+## How it works
 
-Everything you need to create world-class documentation.
+<Steps>
+  <Step title="Boot">
+    The ARM vector table in `root.s` sets up SVC and IRQ stacks, configures VBAR, and calls `main()` in the OS.
+  </Step>
+  <Step title="Process initialization">
+    The OS initializes three processes (OS, P1, P2) with separate memory regions defined in the linker script, then enqueues P1 and P2 into the ready queue.
+  </Step>
+  <Step title="Timer starts">
+    `timer_init()` programs the hardware timer to fire periodic IRQs. `enable_irq()` unmasks interrupts — scheduling begins.
+  </Step>
+  <Step title="Preemptive scheduling">
+    On each timer IRQ, the CPU saves all registers of the current process into its PCB, calls `schedule()` to pick the next process, and restores its registers before returning.
+  </Step>
+</Steps>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Supported platforms
 
-## Need inspiration?
-
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+| Platform | Target | Timer | UART |
+|---|---|---|---|
+| BeagleBone Black | `TARGET=beagle` | DMTIMER2 @ 0x48040000 | UART0 @ 0x44E09000 |
+| QEMU versatilepb | `TARGET=qemu` | SP804 @ 0x101e2000 | PL011 @ 0x101f1000 |

@@ -1,0 +1,374 @@
+---
+title: "Boot sequence"
+description: "From power-on reset through process initialization to the scheduling loop"
+---
+
+When the processor exits reset it jumps to the address stored in the reset vector. On BeagleBone the ROM bootloader copies the ELF binary to DDR3 and jumps to `_start`; on QEMU the `-kernel` flag loads the ELF directly and begins executing at the entry point declared in the linker script (`ENTRY(_start)`).
+
+## `_start` — ARM low-level setup
+
+`_start` in `root.s` runs before any C code. It has three jobs: install the vector table, configure both hardware stacks, and call `main()`.
+
+<Steps>
+  <Step title="Install the vector table">
+    The Cortex-A8 supports a relocatable vector table via the VBAR (Vector Base Address Register) in CP15. `_start` loads the address of `vector_table` and writes it with an `MCR` instruction:
+
+    ```armasm
+    _start:
+        // Configurar VBAR
+        ldr r0, =vector_table
+        mcr p15, 0, r0, c12, c0, 0
+    ```
+
+    The vector table itself is an 8-entry branch table defined immediately before `_start` in the same file:
+
+    ```armasm
+    .align 5
+    vector_table:
+        b _start              @ 0x00 Reset
+        b undefined_handler   @ 0x04 Undefined
+        b swi_handler         @ 0x08 SWI
+        b prefetch_handler    @ 0x0C Prefetch abort
+        b data_handler        @ 0x10 Data abort
+        b .                   @ 0x14 Reserved
+        b irq_handler         @ 0x18 IRQ
+        b fiq_handler         @ 0x1C FIQ
+    ```
+
+    <Note>
+    `.align 5` ensures the table starts on a 32-byte boundary, which is required by the ARM architecture for VBAR.
+    </Note>
+  </Step>
+
+  <Step title="Configure the IRQ stack">
+    ARM uses banked registers for different processor modes. Each mode has its own `sp` and `lr`. `_start` must switch to IRQ mode to set its stack pointer, then switch back:
+
+    ```armasm
+        mrs r0, cpsr
+        bic r1, r0, #0x1F
+        orr r1, r1, #0x12      @ modo IRQ
+        orr r1, r1, #0x80      @ IRQ disable
+        msr cpsr_c, r1
+
+        ldr sp, =_irq_stack_top
+    ```
+
+    `_irq_stack_top` is a linker symbol defined at the top of a 4096-byte `.bss` array in `root.s`:
+
+    ```armasm
+    .section .bss
+    .align 8
+    irq_stack:
+        .space 4096
+    _irq_stack_top:
+    ```
+
+    IRQs are disabled (`#0x80`) throughout this setup to prevent an interrupt firing before the stacks are ready.
+  </Step>
+
+  <Step title="Configure the SVC stack and call main()">
+    After setting the IRQ stack, `_start` switches to SVC mode (the mode C code runs in) and sets the SVC stack pointer to `_stack_top`. This symbol is derived in the linker script from the top of `os_ram`:
+
+    ```armasm
+        bic r1, r0, #0x1F
+        orr r1, r1, #0x13      @ modo SVC
+        orr r1, r1, #0x80      @ IRQ disable
+        msr cpsr_c, r1
+
+        ldr sp, =_stack_top
+
+        // Llamar main del OS
+        bl main
+    ```
+
+    `r0` still holds the original CPSR from `mrs r0, cpsr` at the top of `_start`, so the mode bits from `r0` are reused to construct both the IRQ-mode and SVC-mode CPSR values.
+
+    If `main()` ever returns (it does not under normal operation), execution falls through to:
+
+    ```armasm
+    hang:
+        b hang
+    ```
+  </Step>
+</Steps>
+
+## `main()` — OS kernel initialization
+
+`main()` in `os.c` runs entirely in SVC mode with IRQs still disabled. It initializes every subsystem before enabling the timer interrupt.
+
+<Steps>
+  <Step title="Disable the watchdog">
+    On BeagleBone Black the hardware watchdog starts ticking at boot. If not disabled (or periodically serviced), it resets the board after approximately one minute:
+
+    ```c
+    watchdog_disable();
+    ```
+
+    On QEMU this is a no-op.
+  </Step>
+
+  <Step title="Initialize the ready queue">
+    The scheduler uses a circular singly-linked list managed through a `ProcessQueue` struct. `sched_queue_init` sets the queue to empty:
+
+    ```c
+    sched_queue_init(&ready_queue);
+    ```
+
+    ```c
+    void sched_queue_init(ProcessQueue *q)
+    {
+        q->tail  = NULL;
+        q->count = 0;
+    }
+    ```
+  </Step>
+
+  <Step title="Initialize the three processes">
+    Three `Process` structs — `p0` (OS), `p1`, `p2` — are initialized with `process_init()`. Each call sets the process entry point (`pc`), initial stack pointer (`sp`), and a default SPSR:
+
+    ```c
+    #define PROCESS_STACK_SIZE  0x1000
+
+    process_init(&p0, 0, PLATFORM_OS_BASE, PLATFORM_OS_STACK + PROCESS_STACK_SIZE);
+    process_init(&p1, 1, P1_BASE,          P1_STACK          + PROCESS_STACK_SIZE);
+    process_init(&p2, 2, P2_BASE,          P2_STACK          + PROCESS_STACK_SIZE);
+    ```
+
+    `process_init` zeros all general-purpose registers and sets `spsr = 0x00000013` (SVC mode, IRQs disabled):
+
+    ```c
+    void process_init(Process *p, uint32_t pid, uint32_t pc, uint32_t sp)
+    {
+        int i;
+        p->pid   = pid;
+        p->pc    = pc;
+        p->sp    = sp;
+        p->lr    = 0;
+        p->spsr  = 0x00000013;   // SVC mode, IRQ masked
+        p->state = PROCESS_READY;
+
+        for (i = 0; i < 13; i++) {
+            p->r[i] = 0;
+        }
+    }
+    ```
+
+    The entry point addresses come from the `.venv` file for the current target:
+
+    | Process | BeagleBone `PC` | QEMU `PC` |
+    |---|---|---|
+    | p0 (OS) | `0x82000000` | `0x00010000` |
+    | p1 | `0x82100000` | `0x00060000` |
+    | p2 | `0x82200000` | `0x00080000` |
+  </Step>
+
+  <Step title="Enqueue user processes">
+    Only `p1` and `p2` are placed in the ready queue. `p0` (the OS) is set directly as `CurrProcess` — it is the currently executing process and does not need to be scheduled in:
+
+    ```c
+    sched_enqueue(&ready_queue, &p1);
+    sched_enqueue(&ready_queue, &p2);
+
+    CurrProcess = &p0;
+    ```
+
+    `sched_enqueue` inserts at the tail of the circular list. After both enqueues the queue contains `p1 → p2 → p1 → ...` (circular).
+  </Step>
+
+  <Step title="Start the hardware timer">
+    `timer_init()` programs the platform timer (DMTimer2 on BeagleBone, SP804 on QEMU) to fire a periodic IRQ. The timer base address is `PLATFORM_TIMER_BASE`, injected at compile time:
+
+    ```c
+    timer_init();
+    ```
+
+    The timer interrupt drives all preemptive scheduling. Without it, `schedule()` is never called and only `p0` runs.
+  </Step>
+
+  <Step title="Enable IRQs and enter the OS loop">
+    With all data structures and hardware ready, `main()` clears the I-bit in CPSR to allow interrupts:
+
+    ```c
+    enable_irq();
+    ```
+
+    ```armasm
+    enable_irq:
+        mrs r0, cpsr
+        bic r0, r0, #0x80     @ clear I bit
+        msr cpsr_c, r0
+        bx  lr
+    ```
+
+    The OS then enters its main loop, periodically printing a heartbeat message:
+
+    ```c
+    while (1) {
+        disable_irq();
+        PRINT("----From OS: hola\n");
+        enable_irq();
+    }
+    ```
+
+    The `disable_irq` / `enable_irq` pair around `PRINT` prevents a context switch from interrupting a partially-written UART transmission.
+  </Step>
+</Steps>
+
+## IRQ handler — preemptive context switch
+
+Every timer tick triggers `irq_handler` in `root.s`. This is the core of the preemptive scheduler. The handler runs in IRQ mode, saves the interrupted process, picks the next one, and restores it — all without returning to C via a normal function call.
+
+<Steps>
+  <Step title="Save scratch registers to the IRQ stack">
+    On entry to IRQ mode, `lr_irq` holds `PC_interrupted + 4`. The handler first saves all registers that might be clobbered:
+
+    ```armasm
+    sub  sp, sp, #56
+    stmia sp, {r0-r12, lr}
+    ```
+
+    This pushes r0–r12 (13 registers) and `lr_irq` onto the IRQ stack (56 bytes total).
+  </Step>
+
+  <Step title="Save the interrupted process PCB">
+    The handler reads `CurrProcess` and copies the saved values from the IRQ stack into the PCB fields:
+
+    ```armasm
+    ldr  r4, =CurrProcess
+    ldr  r4, [r4]
+
+    @ save r0-r12 from IRQ stack into PCB
+    ldr  r5, [sp, #0]
+    str  r5, [r4, #PROC_R0]
+    @ ... (repeated for each register)
+
+    @ save SPSR (= CPSR of interrupted process)
+    mrs  r5, spsr
+    str  r5, [r4, #PROC_SPSR]
+
+    @ save PC: lr_irq - 4 = actual interrupted PC
+    ldr  r5, [sp, #52]
+    sub  r5, r5, #4
+    str  r5, [r4, #PROC_PC]
+    ```
+
+    To save `sp_svc` and `lr_svc` of the interrupted process, the handler must temporarily switch to SVC mode (because these are banked registers):
+
+    ```armasm
+    mrs  r6, cpsr
+    bic  r7, r6, #0x1F
+    orr  r7, r7, #0x13     @ SVC mode
+    orr  r7, r7, #0x80
+    msr  cpsr_c, r7
+
+    str  sp, [r4, #PROC_SP]
+    str  lr, [r4, #PROC_LR]
+
+    msr  cpsr_c, r6        @ back to IRQ mode
+    ```
+  </Step>
+
+  <Step title="Clear the timer interrupt and run the scheduler">
+    ```armasm
+    bl   timer_irq_handler   @ clear hardware IRQ flag
+    bl   schedule            @ rotate ready queue, update CurrProcess
+    ```
+
+    `schedule()` in `os.c` enqueues the current process and dequeues the next:
+
+    ```c
+    void schedule(void)
+    {
+        if (CurrProcess != NULL) {
+            CurrProcess->state = PROCESS_READY;
+            sched_enqueue(&ready_queue, CurrProcess);
+        }
+        CurrProcess = sched_dequeue(&ready_queue);
+        if (CurrProcess != NULL) {
+            CurrProcess->state = PROCESS_RUNNING;
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Restore the next process and return">
+    After `schedule()` updates `CurrProcess`, the handler loads the new process's saved context:
+
+    ```armasm
+    ldr  r4, =CurrProcess
+    ldr  r4, [r4]
+
+    @ set lr_irq = new process PC (banked, survives mode switch)
+    ldr  lr, [r4, #PROC_PC]
+
+    @ set spsr_irq = new process CPSR
+    ldr  r5, [r4, #PROC_SPSR]
+    msr  spsr_cxsf, r5
+
+    @ switch to SVC to restore sp_svc and lr_svc
+    mrs  r6, cpsr
+    bic  r7, r6, #0x1F
+    orr  r7, r7, #0x13
+    orr  r7, r7, #0x80
+    msr  cpsr_c, r7
+
+    ldr  sp, [r4, #PROC_SP]
+    ldr  lr, [r4, #PROC_LR]
+
+    msr  cpsr_c, r6        @ back to IRQ mode
+
+    @ restore r0-r12 from PCB
+    add  r4, r4, #PROC_R0
+    ldmia r4, {r0-r12}
+
+    @ atomic: PC = lr_irq, CPSR = SPSR_irq
+    movs pc, lr
+    ```
+
+    `movs pc, lr` is the ARM idiom for returning from an exception: in a privileged mode it copies `SPSR` into `CPSR` and branches to `lr` in a single instruction, atomically restoring the interrupted process.
+  </Step>
+</Steps>
+
+## Complete boot timeline
+
+```
+Reset
+  │
+  ▼  root.s: _start
+  │    MCR p15 → VBAR = &vector_table
+  │    CPSR → IRQ mode  → sp = _irq_stack_top
+  │    CPSR → SVC mode  → sp = _stack_top
+  │    BL main
+  │
+  ▼  os.c: main()
+  │    watchdog_disable()
+  │    sched_queue_init(&ready_queue)
+  │    process_init(&p0, OS_BASE, OS_STACK+0x1000)
+  │    process_init(&p1, P1_BASE, P1_STACK+0x1000)
+  │    process_init(&p2, P2_BASE, P2_STACK+0x1000)
+  │    sched_enqueue(p1)  sched_enqueue(p2)
+  │    CurrProcess = &p0
+  │    timer_init()       ← hardware timer starts counting
+  │    enable_irq()       ← I-bit cleared in CPSR
+  │
+  ▼  OS loop: while(1) { disable_irq; PRINT; enable_irq; }
+  │
+  │    ┌── timer fires ─────────────────────────────────┐
+  │    │                                                 │
+  │    ▼  root.s: irq_handler                           │
+  │    │    save {r0-r12, lr} on IRQ stack              │
+  │    │    save PCB(CurrProcess): r0-r12, SPSR, PC     │
+  │    │    save PCB(CurrProcess): SP, LR (via SVC mode)│
+  │    │    timer_irq_handler()                         │
+  │    │    schedule()  → CurrProcess = p1 (first tick) │
+  │    │    restore next process context from PCB       │
+  │    │    movs pc, lr  → p1 begins executing          │
+  │    │                                                 │
+  │    └── next timer tick ── schedule → p2 → p0 → ...  │
+  │                                                      │
+  └──────────────────────────────────────────────────────┘
+```
+
+<Tip>
+The first time `irq_handler` fires, `CurrProcess` is `&p0` (the OS). After `schedule()`, `CurrProcess` becomes `&p1` and `p1` runs for the first time starting at `P1_BASE`. The OS loop resumes when the scheduler later dequeues `p0` again.
+</Tip>

@@ -1,0 +1,201 @@
+---
+title: "Process management"
+description: "How processes are represented, initialized, and tracked in the OS"
+---
+
+Proyecto1cc7 uses a fixed set of three statically allocated processes. There is no dynamic memory allocation — every Process Control Block (PCB) is a `static` global variable declared in `os.c`. The OS itself runs as process 0; user processes run as processes 1 and 2.
+
+## The Process struct
+
+Each process is described by a `Process` struct defined in `process.h`:
+
+```c process.h
+typedef struct {
+    uint32_t pid;
+    uint32_t r[13];
+    uint32_t sp;
+    uint32_t lr;
+    uint32_t pc;
+    uint32_t spsr;
+    ProcessState state;
+
+    struct Process *next;
+} Process;
+```
+
+<ResponseField name="pid" type="uint32_t">
+  Process identifier. Assigned sequentially: 0 for the OS, 1 for P1, 2 for P2.
+</ResponseField>
+
+<ResponseField name="r[13]" type="uint32_t[13]">
+  Saved general-purpose registers r0 through r12. Captured on every context switch so the process resumes with the correct register values.
+</ResponseField>
+
+<ResponseField name="sp" type="uint32_t">
+  Saved stack pointer (banked SVC-mode `sp_svc`). Each process has its own stack region.
+</ResponseField>
+
+<ResponseField name="lr" type="uint32_t">
+  Saved link register (banked SVC-mode `lr_svc`). Preserves the return address from within a process's call frame.
+</ResponseField>
+
+<ResponseField name="pc" type="uint32_t">
+  Saved program counter. Points to the instruction the process will execute when it is next scheduled.
+</ResponseField>
+
+<ResponseField name="spsr" type="uint32_t">
+  Saved Program Status Register. Stores the CPSR of the interrupted process so that processor mode, condition flags, and interrupt mask bits are restored atomically on re-entry via `movs pc, lr`.
+</ResponseField>
+
+<ResponseField name="state" type="ProcessState">
+  Current lifecycle state of the process (see below).
+</ResponseField>
+
+<ResponseField name="next" type="struct Process *">
+  Intrusive linked-list pointer used by the scheduler to form a circular list. The scheduler does not allocate separate list nodes.
+</ResponseField>
+
+## ProcessState enum
+
+```c process.h
+typedef enum {
+    PROCESS_RUNNING   = 0,
+    PROCESS_READY,
+    PROCESS_WAITING,
+    PROCESS_SLEEPING,
+    PROCESS_TERMINATED
+} ProcessState;
+```
+
+| State | Value | Meaning |
+|---|---|---|
+| `PROCESS_RUNNING` | 0 | The process is currently executing on the CPU. Only one process holds this state at any time. |
+| `PROCESS_READY` | 1 | The process is enqueued and waiting for the scheduler to dispatch it. |
+| `PROCESS_WAITING` | 2 | The process is blocked waiting for an event (reserved for future use). |
+| `PROCESS_SLEEPING` | 3 | The process is suspended for a timed delay (reserved for future use). |
+| `PROCESS_TERMINATED` | 4 | The process has exited and its PCB is no longer in the ready queue. |
+
+<Note>
+  Only `PROCESS_RUNNING` and `PROCESS_READY` are actively used by the current scheduler. The remaining states are defined for future expansion.
+</Note>
+
+## process_init()
+
+`process_init()` zeros and configures a PCB before a process is enqueued for the first time.
+
+```c process.c
+void process_init(Process *p,
+                  uint32_t pid,
+                  uint32_t pc,
+                  uint32_t sp)
+{
+    int i;
+
+    p->pid   = pid;
+    p->pc    = pc;
+    p->sp    = sp;
+    p->lr    = 0;
+    p->spsr  = 0x00000013;
+    p->state = PROCESS_READY;
+
+    for (i = 0; i < 13; i++) {
+        p->r[i] = 0;
+    }
+}
+```
+
+### Parameters
+
+<ParamField path="p" type="Process *" required>
+  Pointer to the statically allocated PCB to initialize.
+</ParamField>
+
+<ParamField path="pid" type="uint32_t" required>
+  Process identifier to assign.
+</ParamField>
+
+<ParamField path="pc" type="uint32_t" required>
+  Initial program counter — the entry-point address the process will begin executing from on its first dispatch.
+</ParamField>
+
+<ParamField path="sp" type="uint32_t" required>
+  Initial stack pointer — the top of the stack region reserved for this process. The value is typically `BASE + PROCESS_STACK_SIZE` where `PROCESS_STACK_SIZE` is `0x1000` (4 KiB).
+</ParamField>
+
+### Field initialization
+
+| Field | Value set | Reason |
+|---|---|---|
+| `pid` | Caller-supplied | Identifies the process. |
+| `pc` | Caller-supplied | Entry point for first dispatch. |
+| `sp` | Caller-supplied | Top of this process's stack. |
+| `lr` | `0` | No caller to return to at process start. |
+| `spsr` | `0x00000013` | SVC mode (`0x13`) with IRQ disabled (bit 7 = 1). Atomically loaded into CPSR on first dispatch via `movs pc, lr`. |
+| `state` | `PROCESS_READY` | Process is ready to run immediately after init. |
+| `r[0..12]` | `0` | All general-purpose registers cleared. |
+
+<Note>
+  `0x00000013` decodes as: mode bits `10011` = Supervisor (SVC), FIQ bit [6] = 0 (enabled), IRQ bit [7] = 0 (enabled). IRQs are enabled from the moment the process first runs. The OS main loop calls `disable_irq()` only around individual `PRINT` calls to prevent interleaved UART output — it does not keep IRQs masked continuously.
+</Note>
+
+## Process initialization in os.c
+
+Three PCBs are declared as `static` globals and initialized in `main()`:
+
+```c os.c
+#define PROCESS_STACK_SIZE  0x1000
+
+static Process      p0;
+static Process      p1;
+static Process      p2;
+static ProcessQueue ready_queue;
+Process *CurrProcess;
+
+int main(void) {
+    watchdog_disable();
+    sched_queue_init(&ready_queue);
+
+    process_init(&p0, 0, PLATFORM_OS_BASE,  PLATFORM_OS_STACK + PROCESS_STACK_SIZE);
+    process_init(&p1, 1, P1_BASE,           P1_STACK          + PROCESS_STACK_SIZE);
+    process_init(&p2, 2, P2_BASE,           P2_STACK          + PROCESS_STACK_SIZE);
+
+    sched_enqueue(&ready_queue, &p1);
+    sched_enqueue(&ready_queue, &p2);
+
+    CurrProcess = &p0;
+
+    timer_init();
+    enable_irq();
+    ...
+}
+```
+
+| PCB | PID | Entry point | Initial stack top |
+|---|---|---|---|
+| `p0` | 0 | `PLATFORM_OS_BASE` | `PLATFORM_OS_STACK + 0x1000` |
+| `p1` | 1 | `P1_BASE` | `P1_STACK + 0x1000` |
+| `p2` | 2 | `P2_BASE` | `P2_STACK + 0x1000` |
+
+<Note>
+  `p1` and `p2` are enqueued in the ready queue before the timer starts. `p0` (the OS process) is assigned directly to `CurrProcess` — it does not go through the queue on startup and begins running immediately after `enable_irq()`.
+</Note>
+
+## CurrProcess
+
+`CurrProcess` is a single global pointer (`Process *`) exported from `os.c`:
+
+```c os.c
+Process *CurrProcess;
+```
+
+It is read by the IRQ handler in `root.s` to find the PCB of the currently executing process, and written by `schedule()` to point at the next process after a context switch. Because it is accessed from both C and assembly, it is declared with external linkage (no `static`).
+
+## Circular linked list
+
+The `next` field in each PCB forms an intrusive circular singly-linked list managed by the scheduler. After both user processes are enqueued, the list looks like:
+
+```
+tail → p2 → p1 → p2 (wraps)
+```
+
+The scheduler's head is always `tail->next`. Enqueuing appends to the tail; dequeuing removes from the head. All linking is done via the `next` pointer already embedded in the `Process` struct — no heap allocation is ever performed.

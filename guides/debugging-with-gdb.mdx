@@ -1,0 +1,213 @@
+---
+title: "Debugging with GDB"
+description: "How to use gdb-multiarch with QEMU's built-in GDB server to debug the OS"
+---
+
+The QEMU target launches a GDB stub that lets you connect `gdb-multiarch`, set breakpoints, inspect process control blocks, and single-step through both OS and user-process code without any extra hardware. The BeagleBone target does not expose a GDB server by default, so all interactive debugging is done against QEMU.
+
+<Warning>
+  QEMU's `-nographic` flag routes the UART to stdout in the same terminal
+  session. To exit QEMU press **Ctrl+A** then **X**. Closing the terminal or
+  sending Ctrl+C will kill the GDB session but may leave QEMU running in the
+  background.
+</Warning>
+
+<Steps>
+
+<Step title="Build with debug symbols">
+
+Build for the QEMU target:
+
+```bash
+make TARGET=qemu
+```
+
+When `TARGET=qemu` the Makefile selects these compiler and assembler flags:
+
+```makefile
+CFLAGS  = $(BASE_CFLAGS) -O0 -g3 $(PLATFORM_FLAGS)
+ASFLAGS = $(BASE_ASFLAGS) -g
+```
+
+`-O0` disables all optimisations so variables are never elided and the source-to-instruction correspondence is 1:1. `-g3` emits the maximum DWARF debug information, including macro definitions. The BeagleBone target uses `-O2` with no `-g` flag, so release builds produce no debug symbols and cannot be introspected with source-level GDB.
+
+The output ELF is written to `bin/program.elf`.
+
+</Step>
+
+<Step title="Launch QEMU with the GDB server">
+
+Run QEMU manually, or use the `make qemu` convenience target. The manual command is:
+
+```bash
+qemu-system-arm \
+    -M versatilepb \
+    -cpu cortex-a8 \
+    -kernel bin/program.elf \
+    -nographic \
+    -S -s
+```
+
+| Flag         | Effect                                                                 |
+| ------------ | ---------------------------------------------------------------------- |
+| `-M versatilepb` | Emulate the Versatile/PB baseboard, which is what the QEMU linker script targets. |
+| `-cpu cortex-a8` | Match the Cortex-A8 used by the BeagleBone Black and the compiler's `-mcpu=cortex-a8` flag. |
+| `-nographic` | Route UART0 (base `0x101f1000` in QEMU) to the terminal's stdout/stdin. |
+| `-S`         | Freeze the CPU at reset and wait for a GDB `continue` before executing any instructions. |
+| `-s`         | Open a GDB remote stub on TCP port 1234 (shorthand for `-gdb tcp::1234`). |
+
+QEMU will appear to hang — this is expected. The CPU is halted at the reset vector waiting for GDB.
+
+<Note>
+  `make qemu` builds the ELF and then launches the same QEMU command. It also
+  prints the exact GDB commands needed to connect, which matches what is shown
+  in the next step.
+</Note>
+
+</Step>
+
+<Step title="Connect GDB">
+
+In a second terminal, start `gdb-multiarch` and connect to the stub:
+
+```text
+$ gdb-multiarch bin/program.elf
+(gdb) set architecture arm
+(gdb) target remote :1234
+(gdb) file bin/program.elf
+(gdb) break main
+(gdb) continue
+```
+
+- `set architecture arm` — tells GDB to use the 32-bit ARM instruction set decoder. Without this, GDB may misidentify the architecture from the ELF header.
+- `target remote :1234` — connects to the QEMU GDB stub on localhost port 1234.
+- `file bin/program.elf` — (re-)loads the symbol table. If you already passed the ELF on the command line this is redundant, but it is harmless and ensures symbols are loaded after the remote is connected.
+- `break main` — sets a breakpoint at the start of `main()` in `OS/os.c`.
+- `continue` — releases the CPU from its initial halt; execution runs until the breakpoint is hit.
+
+</Step>
+
+<Step title="Useful GDB commands for OS debugging">
+
+**Registers and disassembly**
+
+```text
+(gdb) info registers
+(gdb) x/10i $pc
+```
+
+`info registers` prints all 16 ARM core registers (`r0`–`r15`) plus `cpsr` and `spsr`. `x/10i $pc` disassembles 10 instructions starting at the current program counter — useful after a crash when source correlation is lost.
+
+**Reading CPSR mode bits**
+
+The bottom 5 bits of `cpsr` encode the current ARM processor mode:
+
+| Bits [4:0] | Mode        |
+| ---------- | ----------- |
+| `0x10`     | User        |
+| `0x12`     | IRQ         |
+| `0x13`     | Supervisor (SVC) |
+
+```text
+(gdb) p/x $cpsr & 0x1f
+```
+
+A value of `0x13` means the CPU is in SVC mode (where `main` and `schedule` run). A value of `0x12` means it is inside the IRQ handler.
+
+**Inspecting the current process PCB**
+
+`CurrProcess` is a global `Process *` in `OS/os.c`:
+
+```text
+(gdb) p *CurrProcess
+```
+
+This prints the full `Process` struct defined in `OS/process.h`:
+
+```text
+$1 = {
+  pid   = 1,
+  r     = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+  sp    = 0x82111000,
+  lr    = 0,
+  pc    = 0x82100000,
+  spsr  = 0x13,
+  state = PROCESS_RUNNING,
+  next  = 0x20008060
+}
+```
+
+**Inspecting the scheduler queue**
+
+```text
+(gdb) p ready_queue
+```
+
+This prints the `ProcessQueue` struct, which holds a `tail` pointer and a `count`:
+
+```text
+$2 = {tail = 0x20008060, count = 2}
+```
+
+Follow `tail->next` manually to walk the circular list, or dereference individual process variables:
+
+```text
+(gdb) p p1
+(gdb) p p2
+```
+
+**Process state values**
+
+The `ProcessState` enum (`OS/process.h`) maps to integers as follows:
+
+| Value | Name               |
+| ----- | ------------------ |
+| `0`   | `PROCESS_RUNNING`  |
+| `1`   | `PROCESS_READY`    |
+| `2`   | `PROCESS_WAITING`  |
+| `3`   | `PROCESS_SLEEPING` |
+| `4`   | `PROCESS_TERMINATED` |
+
+**Breakpoints for scheduler and IRQ events**
+
+```text
+(gdb) break schedule
+(gdb) break irq_handler
+```
+
+`break schedule` stops execution at the top of `schedule()` in `OS/os.c` on every context switch triggered by the timer IRQ. `break irq_handler` stops on every timer interrupt before the scheduler is called — useful for checking which process was preempted.
+
+</Step>
+
+<Step title="Inspecting process state in detail">
+
+Print each field of a process PCB individually for a cleaner view:
+
+```text
+(gdb) p CurrProcess->pid
+(gdb) p/x CurrProcess->pc
+(gdb) p/x CurrProcess->sp
+(gdb) p/x CurrProcess->spsr
+(gdb) p CurrProcess->state
+```
+
+`spsr` holds the CPSR value that was in effect when the process was last preempted. `process_init` initialises it to `0x00000013` (SVC mode, all interrupt flags clear, ARM instruction set), so a freshly created process that has never been context-switched will show this value.
+
+To examine the saved stack of a process that is not currently running, use its `sp` field as the base address:
+
+```text
+(gdb) x/16x p1.sp
+```
+
+This dumps 16 words from the top of P1's stack, which is where the exception entry code saved the register frame before calling `schedule()`.
+
+<Tip>
+  GDB's TUI mode gives a split view with source or assembly alongside the
+  command prompt. Use `layout src` to show C source (requires DWARF info from
+  `-g3`) or `layout asm` to show the disassembly window. Press **Ctrl+X A** to
+  toggle TUI mode on and off.
+</Tip>
+
+</Step>
+
+</Steps>

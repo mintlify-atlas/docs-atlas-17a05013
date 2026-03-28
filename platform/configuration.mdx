@@ -1,0 +1,214 @@
+---
+title: "Platform configuration"
+description: "How platform-specific addresses and settings are passed to the compiler"
+---
+
+All hardware addresses and platform settings live in environment files under `OS/`. The Makefile reads the correct file at build time based on the `TARGET` variable and converts every entry into a C preprocessor flag.
+
+## Environment files
+
+<Tabs>
+  <Tab title=".venv.beagle">
+    ```bash OS/.venv.beagle
+    PLATFORM_TARGET=0
+
+    OS_BASE=0x82000000
+    OS_STACK=0x82010000
+
+    P1_BASE=0x82100000
+    P1_STACK=0x82110000
+
+    P2_BASE=0x82200000
+    P2_STACK=0x82210000
+
+    UART0_BASE=0x44E09000
+    TIMER_BASE=0x48040000
+    INTC_BASE=0x48200000
+    CM_PER_BASE=0x44E00000
+    ```
+  </Tab>
+  <Tab title=".venv.qemu">
+    ```bash OS/.venv.qemu
+    PLATFORM_TARGET=1
+
+    OS_BASE=0x00010000
+    OS_STACK=0x00020000
+
+    P1_BASE=0x00060000
+    P1_STACK=0x00070000
+
+    P2_BASE=0x00080000
+    P2_STACK=0x00090000
+
+    UART0_BASE=0x101f1000
+    TIMER_BASE=0x101e2000
+    INTC_BASE=0x10140000
+    CM_PER_BASE=0x00000000
+    ```
+  </Tab>
+</Tabs>
+
+## How the Makefile loads the environment
+
+The Makefile selects the correct environment file using `make`'s `include` directive:
+
+```makefile Makefile
+TARGET ?= beagle
+
+ifeq ($(TARGET), qemu)
+    include $(OS_DIR)/.venv.qemu
+else
+    include $(OS_DIR)/.venv.beagle
+endif
+```
+
+`TARGET` defaults to `beagle` when not specified. Every variable in the included file becomes an ordinary Makefile variable available for use in flag construction.
+
+## PLATFORM\_FLAGS
+
+Immediately after loading the environment file, the Makefile constructs `PLATFORM_FLAGS` — a list of `-D` defines passed to every C and assembly compilation unit:
+
+```makefile Makefile
+PLATFORM_FLAGS = -DPLATFORM_TARGET=$(PLATFORM_TARGET) \
+                 -DPLATFORM_UART0_BASE=$(UART0_BASE) \
+                 -DPLATFORM_TIMER_BASE=$(TIMER_BASE) \
+                 -DPLATFORM_INTC_BASE=$(INTC_BASE) \
+                 -DPLATFORM_CM_PER_BASE=$(CM_PER_BASE) \
+                 -DPLATFORM_OS_BASE=$(OS_BASE) \
+                 -DPLATFORM_OS_STACK=$(OS_STACK) \
+                 -DP1_BASE=$(P1_BASE) \
+                 -DP1_STACK=$(P1_STACK) \
+                 -DP2_BASE=$(P2_BASE) \
+                 -DP2_STACK=$(P2_STACK)
+```
+
+| Flag | Source variable | Purpose |
+|---|---|---|
+| `PLATFORM_TARGET` | `PLATFORM_TARGET` | Selects platform branch (`0` = BeagleBone, `1` = QEMU) |
+| `PLATFORM_UART0_BASE` | `UART0_BASE` | Base address of the UART peripheral |
+| `PLATFORM_TIMER_BASE` | `TIMER_BASE` | Base address of the timer peripheral |
+| `PLATFORM_INTC_BASE` | `INTC_BASE` | Base address of the interrupt controller |
+| `PLATFORM_CM_PER_BASE` | `CM_PER_BASE` | Base address of the Clock Manager (`0` on QEMU) |
+| `PLATFORM_OS_BASE` | `OS_BASE` | Load address of the OS image |
+| `PLATFORM_OS_STACK` | `OS_STACK` | Top of the OS stack |
+| `P1_BASE` | `P1_BASE` | Load address of process 1 |
+| `P1_STACK` | `P1_STACK` | Top of the process 1 stack |
+| `P2_BASE` | `P2_BASE` | Load address of process 2 |
+| `P2_STACK` | `P2_STACK` | Top of the process 2 stack |
+
+## plataform.h — address aliases
+
+`OS/plataform.h` maps the `PLATFORM_*` defines to shorter, canonical names used throughout the OS and library source:
+
+```c OS/plataform.h
+#ifndef PLATFORM_H
+#define PLATFORM_H
+
+#ifndef PLATFORM_UART0_BASE
+#error "PLATFORM_UART0_BASE no definido"
+#endif
+
+#ifndef PLATFORM_TIMER_BASE
+#error "PLATFORM_TIMER_BASE no definido"
+#endif
+
+#ifndef PLATFORM_INTC_BASE
+#error "PLATFORM_INTC_BASE no definido"
+#endif
+
+#define UART0_BASE       PLATFORM_UART0_BASE
+#define DMTIMER2_BASE    PLATFORM_TIMER_BASE
+#define INTCPS_BASE      PLATFORM_INTC_BASE
+#define CM_PER_BASE      PLATFORM_CM_PER_BASE
+
+#endif
+```
+
+The header enforces at compile time that all three required base addresses are defined — a missing `.venv` entry produces a hard `#error` rather than a silent wrong-address bug.
+
+| Alias in source | Provided by |
+|---|---|
+| `UART0_BASE` | `PLATFORM_UART0_BASE` |
+| `DMTIMER2_BASE` | `PLATFORM_TIMER_BASE` |
+| `INTCPS_BASE` | `PLATFORM_INTC_BASE` |
+| `CM_PER_BASE` | `PLATFORM_CM_PER_BASE` |
+
+## Platform conditionals in source code
+
+Both `uart.c` and `timer.c` use `#if PLATFORM_TARGET == 1` / `#else` blocks to select the correct register layout at compile time. No runtime branching occurs.
+
+### uart.c
+
+```c OS/uart.c
+#if PLATFORM_TARGET == 1
+    // QEMU PL011 UART
+    #define UART_DR      0x00  // Data Register
+    #define UART_FR      0x18  // Flag Register
+    #define UART_FR_TXFF 0x20  // Transmit FIFO Full
+    #define UART_FR_RXFE 0x10  // Receive FIFO Empty
+
+    volatile unsigned int * const UART0 = (unsigned int *)UART0_BASE;
+#else
+    // BeagleBone TL16C750-compatible UART0
+    #define UART_THR       (UART0_BASE + 0x00)  // Transmit Holding Register
+    #define UART_LSR       (UART0_BASE + 0x14)  // Line Status Register
+    #define UART_LSR_THRE  0x20                 // Transmit Holding Register Empty
+    #define UART_LSR_RXFE  0x10                 // Receive FIFO Empty
+#endif
+```
+
+### timer.c
+
+```c Lib/timer.c
+void timer_init(void) {
+#if PLATFORM_TARGET == 1
+    // QEMU SP804 timer at PLATFORM_TIMER_BASE
+    PUT32(PLATFORM_TIMER_BASE + 0x08, 0);
+    PUT32(PLATFORM_TIMER_BASE + 0x00, FREQ_QEMU);
+    PUT32(PLATFORM_TIMER_BASE + 0x0C, 1);
+    PUT32(PLATFORM_INTC_BASE + 0x10, (1 << 4));
+    PUT32(PLATFORM_TIMER_BASE + 0x08, 0xE2);
+#else
+    // BeagleBone DMTIMER2
+    PUT32(CM_PER_TIMER2_CLKCTRL, 0x2);
+    PUT32(INTC_MIR_CLEAR2, (1 << 4));
+    PUT32(INTC_ILR68, 0x0);
+    PUT32(TCLR, 0x0);
+    PUT32(TISR, 0x7);
+    PUT32(TLDR, FREQ_BEAGLE);
+    PUT32(TCRR, FREQ_BEAGLE);
+    PUT32(TIER, 0x2);
+    PUT32(TCLR, 0x3);
+#endif
+}
+```
+
+## Build variable summary
+
+| `TARGET` | `.venv` file | Linker script | C optimization | Assembly debug |
+|---|---|---|---|---|
+| `beagle` (default) | `OS/.venv.beagle` | `linker/linker_beagle.ld` | `-O2` | none |
+| `qemu` | `OS/.venv.qemu` | `linker/linker_qemu.ld` | `-O0 -g3` | `-g` |
+
+## Adding a new platform
+
+To support an additional board or emulator, four changes are required:
+
+<Steps>
+  <Step title="Create a new environment file">
+    Add `OS/.venv.<platform>` following the same key=value format as `.venv.beagle` and `.venv.qemu`. Assign a unique `PLATFORM_TARGET` integer.
+  </Step>
+  <Step title="Add a new linker script">
+    Create `linker/linker_<platform>.ld` with `MEMORY` regions that match the target board's RAM layout and the addresses in your new `.venv` file.
+  </Step>
+  <Step title="Extend the Makefile">
+    Add a new `ifeq ($(TARGET), <platform>)` branch to load the environment file and select the linker script and compiler flags.
+  </Step>
+  <Step title="Update platform conditionals in source">
+    Add `#elif PLATFORM_TARGET == <N>` branches inside the `#if` blocks in `OS/uart.c` and `Lib/timer.c` to implement the correct register sequences for the new peripheral set.
+  </Step>
+</Steps>
+
+<Note>
+  `OS/plataform.h` does not need to change for a new platform — it already exposes generic aliases (`UART0_BASE`, `DMTIMER2_BASE`, `INTCPS_BASE`, `CM_PER_BASE`) driven entirely by the `PLATFORM_*` defines coming from the `.venv` file.
+</Note>

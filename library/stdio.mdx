@@ -1,0 +1,138 @@
+---
+title: "stdio — PRINT and READ"
+description: "Printf-like output and scanf-like input over UART"
+---
+
+`stdio` is a bare-metal replacement for `printf` and `scanf`. It has no dependency on libc and is compiled with `-nostdlib`. All output and input goes directly through the UART driver.
+
+## PRINT
+
+```c
+void PRINT(const char *s, ...);
+```
+
+Iterates over the format string character by character. When a `%` specifier is encountered, it pulls the next argument from the varargs list and routes it to the appropriate alphanumeric conversion or UART output function.
+
+### Format specifiers
+
+| Specifier | Type | Conversion |
+|-----------|------|------------|
+| `%d` | `int` | `uart_itoa()` → `uart_puts()` |
+| `%f` | `float` (promoted to `double` in varargs) | `uart_ftoa()` → `uart_puts()` |
+| `%s` | `char *` | `uart_puts()` directly |
+| `%c` | `char` (promoted to `int` in varargs) | `uart_putc()` directly |
+
+### Implementation
+
+```c
+void PRINT(const char *s, ...){
+    va_list args;
+    va_start(args, s);
+
+    while (*s) {
+        if(*s == '%'){
+            char buffer[16];
+            s++;
+            if (*s == 'f') {
+                double v = va_arg(args, double);
+                uart_ftoa((float)v, buffer);
+                uart_puts(buffer);
+            }
+            if(*s == 'd'){
+                int v = va_arg(args, int);
+                uart_itoa(v, buffer);
+                uart_puts(buffer);
+            }
+            if(*s == 's'){
+                char *v = va_arg(args, char*);
+                uart_puts(v);
+            }
+            if(*s == 'c'){
+                char v = (char)va_arg(args, int);
+                uart_putc(v);
+            }
+            s++;
+        }
+        else{
+            uart_putc(*s++);
+        }
+    }
+
+    va_end(args);
+}
+```
+
+### Usage in user processes
+
+Process 1 (`User/P1/main.c`) prints a counter as a decimal integer:
+
+```c
+PRINT("----From P1: %d\n", i);
+```
+
+Process 2 (`User/P2/main.c`) prints a character cycling through the alphabet:
+
+```c
+PRINT("----From P2: %c\n", c);
+```
+
+## READ
+
+```c
+void READ(char *type, void *returnv);
+```
+
+Reads up to 16 characters from UART into a local buffer, then converts the string to the requested type using the alphanumeric library.
+
+### Format specifiers
+
+| Specifier | Conversion | Output type |
+|-----------|------------|-------------|
+| `"%d"` | `uart_atoi()` | `int` written to `*returnv` |
+| `"%f"` | `uart_atof()` | `float` written to `*returnv` |
+
+### Implementation
+
+```c
+void READ(char *type, void *returnv){
+    char input[16];
+
+    uart_gets_input(input, sizeof(input));
+
+    if(*type == '%'){
+        type++;
+        if(*type == 'f'){
+            *(float *) returnv = uart_atof(input);
+        }
+        if(*type == 'd'){
+            *(int *) returnv = uart_atoi(input);
+        }
+    }
+}
+```
+
+### Usage
+
+```c
+int value;
+READ("%d", &value);
+
+float temp;
+READ("%f", &temp);
+```
+
+## Critical section requirement
+
+<Warning>
+`PRINT` must be called between `disable_irq()` and `enable_irq()` in user processes. Without this guard, the timer IRQ can preempt mid-print and a context switch to another process will interleave output on the UART, producing garbled characters.
+</Warning>
+
+Both user processes follow this pattern:
+
+```c
+disable_irq();
+PRINT("----From P1: %d\n", i);
+enable_irq();
+```
+
+The IRQ is re-enabled immediately after `PRINT` returns so that the scheduler continues to receive timer interrupts normally.

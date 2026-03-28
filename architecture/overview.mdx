@@ -1,0 +1,159 @@
+---
+title: "Architecture overview"
+description: "How the kernel, scheduler, processes, and hardware drivers fit together"
+---
+
+Proyecto1cc7 is a minimal preemptive operating system for ARM Cortex-A8 running on bare metal — no Linux, no RTOS, no MMU. It supports two user processes (`p1`, `p2`) scheduled by a round-robin IRQ-driven scheduler alongside the OS process (`p0`).
+
+## Layers
+
+The system is organized into three layers that map directly to the source tree:
+
+| Layer | Source | Role |
+|---|---|---|
+| **Boot / low-level** | `root.s` | Vector table, `_start`, IRQ handler, context save/restore, `yield`, `PUT32`/`GET32` |
+| **OS kernel** | `os.c`, `scheduler.c`, `process.c` | Process initialization, round-robin scheduler, `main()` loop |
+| **Platform drivers** | `uart.c`, `timer.c`, `watchdog.c` | Hardware peripherals, abstracted via `plataform.h` |
+| **User processes** | `User/p1/`, `User/p2/` | Application code linked into separate RAM regions |
+
+## Component diagram
+
+```
+root.s (_start)
+  │  Sets VBAR, configures IRQ and SVC stacks, calls main()
+  │
+  ▼
+os.c (main)
+  │  watchdog_disable() → sched_queue_init() → process_init() × 3
+  │  sched_enqueue(p1, p2) → timer_init() → enable_irq() → OS loop
+  │
+  ├─► scheduler.c          Round-robin circular linked list (ProcessQueue)
+  │     sched_enqueue / sched_dequeue / sched_peek / sched_rotate
+  │
+  ├─► process.c            PCB initialization (pid, pc, sp, spsr, r[0..12])
+  │
+  ├─► uart.c               UART0 driver  — PRINT() macro output
+  ├─► timer.c              DMTimer2 / SP804 driver — periodic IRQ source
+  └─► watchdog.c           Watchdog disable (BeagleBone only)
+
+          ▲
+          │  Hardware IRQ (every timer tick)
+          │
+root.s (irq_handler)
+  Saves r0-r12, SPSR, PC, SP, LR of interrupted process into its PCB
+  → timer_irq_handler()   clears hardware interrupt flag
+  → schedule()            rotates ready queue, updates CurrProcess
+  Restores next process registers from its PCB → movs pc, lr
+```
+
+## Memory spaces
+
+Each entity in the system has its own RAM region enforced by the linker script. There is no MMU — isolation is purely by convention.
+
+### BeagleBone Black
+
+| Region | Origin | Length | Purpose |
+|---|---|---|---|
+| `os_ram` | `0x82000000` | 256 KB | OS `.text`, `.data`, `.bss`, IRQ stack, OS SVC stack |
+| `p1_ram` | `0x82100000` | 64 KB | P1 `.p1_text`, `.p1_data`, `.p1_bss` |
+| `p1_stack` | `0x82110000` | 4 KB | P1 SVC stack |
+| `p2_ram` | `0x82200000` | 64 KB | P2 `.p2_text`, `.p2_data`, `.p2_bss` |
+| `p2_stack` | `0x82210000` | 4 KB | P2 SVC stack |
+
+### QEMU (versatilepb)
+
+| Region | Origin | Length | Purpose |
+|---|---|---|---|
+| `os_ram` | `0x00010000` | 64 KB | OS `.text`, `.data`, `.bss`, IRQ stack, OS SVC stack |
+| `p1_ram` | `0x00060000` | 64 KB | P1 code and data |
+| `p1_stack` | `0x00070000` | 4 KB | P1 SVC stack |
+| `p2_ram` | `0x00080000` | 64 KB | P2 code and data |
+| `p2_stack` | `0x00090000` | 4 KB | P2 SVC stack |
+
+<Note>
+The IRQ stack (4096 bytes, defined in `root.s` as `irq_stack: .space 4096`) lives inside `os_ram` in `.bss`. It is separate from the SVC stack used by the OS main loop.
+</Note>
+
+## Execution flow
+
+```
+Power-on reset
+     │
+     ▼
+_start  (root.s)
+  • MCR p15 → sets VBAR to &vector_table
+  • Enter IRQ mode → SP = _irq_stack_top
+  • Enter SVC mode → SP = _stack_top
+  • BL main
+     │
+     ▼
+main()  (os.c)
+  • watchdog_disable()
+  • sched_queue_init(&ready_queue)
+  • process_init(&p0, &p1, &p2)   — set PC, SP, SPSR = 0x13
+  • sched_enqueue(p1), sched_enqueue(p2)
+  • CurrProcess = &p0
+  • timer_init()                  — starts periodic hardware IRQ
+  • enable_irq()                  — clears I-bit in CPSR
+     │
+     ▼
+OS loop: while(1) { disable_irq; PRINT; enable_irq; }
+     │
+     │  (every timer tick)
+     ▼
+irq_handler  (root.s)
+  • Save interrupted process into its PCB
+  • timer_irq_handler()
+  • schedule()        ← round-robin: enqueue current, dequeue next
+  • Restore next process from its PCB
+  • movs pc, lr       ← atomic branch + CPSR restore
+     │
+     ▼
+Next process resumes at exactly the instruction it was interrupted at
+```
+
+## Key design decisions
+
+<AccordionGroup>
+  <Accordion title="No MMU / no virtual memory">
+    The Cortex-A8 MMU is never enabled. Each process runs in its physical address region established by the linker. There is no page table, no TLB management, and no fault handler beyond a hang loop.
+  </Accordion>
+
+  <Accordion title="No system calls (SWI unused)">
+    The `swi_handler` in `root.s` simply branches to `hang`. Processes do not call into the OS through a syscall gate. The `yield` function is a direct call from user code — compiled into the same flat binary — that manually saves context and invokes `schedule()`.
+  </Accordion>
+
+  <Accordion title="Flat address space with linker-enforced separation">
+    All code — OS, p1, p2 — lives in a single ELF binary linked together. Separation is enforced entirely by the linker script: p1 code must be placed in `.p1_text` sections, p2 code in `.p2_text` sections. `KEEP()` directives prevent the linker from discarding these sections during dead-code elimination.
+  </Accordion>
+
+  <Accordion title="Platform abstraction via compile-time defines">
+    Hardware base addresses (UART0, timer, interrupt controller) are not hardcoded in driver source. They are injected as `-D` flags at compile time. The Makefile reads `.venv.beagle` or `.venv.qemu` depending on the `TARGET` variable and passes every address as a `PLATFORM_*` define consumed by `plataform.h`.
+  </Accordion>
+
+  <Accordion title="Two ARM mode stacks">
+    ARM banked registers mean IRQ mode and SVC mode each have their own `sp` and `lr`. `root.s` initializes both: `_irq_stack_top` for IRQ mode and `_stack_top` for SVC mode. Context save/restore must temporarily switch to SVC mode to read or write `sp_svc` and `lr_svc` of the interrupted process.
+  </Accordion>
+</AccordionGroup>
+
+## Hardware peripheral addresses
+
+The following addresses are injected as compile-time defines by the Makefile from the platform `.venv` files.
+
+### BeagleBone Black
+
+| Peripheral | Address | Define |
+|---|---|---|
+| UART0 | `0x44E09000` | `PLATFORM_UART0_BASE` |
+| DMTimer2 | `0x48040000` | `PLATFORM_TIMER_BASE` |
+| INTC | `0x48200000` | `PLATFORM_INTC_BASE` |
+| CM_PER | `0x44E00000` | `PLATFORM_CM_PER_BASE` |
+
+### QEMU (versatilepb)
+
+| Peripheral | Address | Define |
+|---|---|---|
+| UART0 | `0x101f1000` | `PLATFORM_UART0_BASE` |
+| SP804 Timer | `0x101e2000` | `PLATFORM_TIMER_BASE` |
+| VIC | `0x10140000` | `PLATFORM_INTC_BASE` |
+| CM_PER | `0x00000000` | `PLATFORM_CM_PER_BASE` (unused) |

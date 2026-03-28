@@ -1,0 +1,162 @@
+---
+title: "QEMU emulation"
+description: "Running and debugging the OS in QEMU versatilepb emulation"
+---
+
+Set `PLATFORM_TARGET=1` to target the QEMU `versatilepb` machine. This mode uses `-O0 -g3` compiler flags and adds `-g` for assembly, making it the recommended target for development and debugging.
+
+## QEMU machine
+
+| Setting | Value |
+|---|---|
+| Machine (`-M`) | `versatilepb` |
+| CPU (`-cpu`) | `cortex-a8` |
+
+## Hardware peripherals
+
+The `versatilepb` machine exposes the following memory-mapped peripherals:
+
+| Peripheral | Address | Description |
+|---|---|---|
+| UART (PL011) | `0x101f1000` | ARM PrimeCell UART |
+| SP804 timer | `0x101e2000` | Dual-timer module |
+| VIC | `0x10140000` | Vectored interrupt controller |
+
+## Memory layout
+
+The linker script `linker/linker_qemu.ld` places the image in low RAM:
+
+| Region | Origin | Size |
+|---|---|---|
+| `os_ram` | `0x00010000` | 64K |
+| `p1_ram` | `0x00060000` | 64K |
+| `p1_stack` | `0x00070000` | 4K |
+| `p2_ram` | `0x00080000` | 64K |
+| `p2_stack` | `0x00090000` | 4K |
+
+```ld linker/linker_qemu.ld
+MEMORY
+{
+    os_ram : ORIGIN = 0x00010000, LENGTH = 64K
+    p1_ram : ORIGIN  = 0x00060000, LENGTH = 64K
+    p1_stack : ORIGIN = 0x00070000, LENGTH = 4K
+    p2_ram : ORIGIN = 0x00080000, LENGTH = 64K
+    p2_stack : ORIGIN = 0x00090000, LENGTH = 4K
+}
+```
+
+The QEMU linker script also defines a dedicated `.irq_stack` section inside `os_ram`, placed after `.bss` and aligned to 8 bytes.
+
+## Building
+
+```bash
+make TARGET=qemu
+```
+
+Or use the convenience alias (this also launches QEMU with the GDB server):
+
+```bash
+make qemu
+```
+
+The `qemu` alias builds the image and then launches QEMU with `-S -s` (GDB server on port 1234) automatically.
+
+## Running
+
+<Tabs>
+  <Tab title="Without GDB">
+    Run the OS directly — UART output appears in the current terminal:
+
+    ```bash
+    qemu-system-arm -M versatilepb -cpu cortex-a8 -kernel bin/program.elf -nographic
+    ```
+
+    The `-nographic` flag disables the graphical window and routes the emulated PL011 UART (`0x101f1000`) to your terminal's stdin/stdout.
+  </Tab>
+  <Tab title="With GDB server">
+    Start QEMU paused, waiting for a GDB connection on port 1234:
+
+    ```bash
+    qemu-system-arm -M versatilepb -cpu cortex-a8 -kernel bin/program.elf -nographic -S -s
+    ```
+
+    `-S` halts the CPU at startup. `-s` is shorthand for `-gdb tcp::1234`.
+  </Tab>
+</Tabs>
+
+## Debugging with GDB
+
+<Steps>
+  <Step title="Start QEMU with the GDB server">
+    In one terminal, launch QEMU paused (see above). QEMU will print nothing and wait for a debugger to connect.
+  </Step>
+  <Step title="Connect GDB in a second terminal">
+    ```bash
+    gdb-multiarch bin/program.elf
+    ```
+  </Step>
+  <Step title="Configure the architecture and connect">
+    Inside GDB:
+
+    ```text
+    set architecture arm
+    target remote :1234
+    ```
+  </Step>
+  <Step title="Set a breakpoint and run">
+    ```text
+    break main
+    continue
+    ```
+
+    GDB will halt at the start of `main` and allow you to step through the OS.
+  </Step>
+</Steps>
+
+<Tip>
+  Because the QEMU build uses `-O0 -g3`, all local variables and inlined functions are visible in GDB without being optimized away.
+</Tip>
+
+## Timer configuration
+
+The SP804 timer on `versatilepb` is configured with a 1 MHz load value:
+
+```c Lib/timer.c
+#define FREQ_QEMU   1 * 1000000
+```
+
+The `timer_init()` SP804 sequence:
+
+```c Lib/timer.c
+PUT32(PLATFORM_TIMER_BASE + 0x08, 0);           // stop timer
+PUT32(PLATFORM_TIMER_BASE + 0x00, FREQ_QEMU);   // load value
+PUT32(PLATFORM_TIMER_BASE + 0x0C, 1);           // clear interrupt
+PUT32(PLATFORM_INTC_BASE  + 0x10, (1 << 4));    // unmask VIC line
+PUT32(PLATFORM_TIMER_BASE + 0x08, 0xE2);        // enable + periodic + irq
+```
+
+## Environment file
+
+The `.venv.qemu` file defines all platform addresses loaded by the Makefile when `TARGET=qemu`:
+
+```bash OS/.venv.qemu
+PLATFORM_TARGET=1
+
+OS_BASE=0x00010000
+OS_STACK=0x00020000
+
+P1_BASE=0x00060000
+P1_STACK=0x00070000
+
+P2_BASE=0x00080000
+P2_STACK=0x00090000
+
+UART0_BASE=0x101f1000
+TIMER_BASE=0x101e2000
+INTC_BASE=0x10140000
+CM_PER_BASE=0x00000000
+```
+
+<Note>
+  `CM_PER_BASE` is set to `0x00000000` for QEMU because the VersatilePB machine has no Clock Manager peripheral. The `CM_PER_TIMER2_CLKCTRL` write in `timer.c` lives in the `#else` branch (BeagleBone path, `PLATFORM_TARGET != 1`), so it is not executed on QEMU builds where `PLATFORM_TARGET == 1` routes to the SP804 path instead.
+</Note>

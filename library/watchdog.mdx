@@ -1,0 +1,79 @@
+---
+title: "Watchdog"
+description: "BeagleBone Black hardware watchdog disable on boot"
+---
+
+On BeagleBone Black, the hardware watchdog timer (WDT1) is active immediately after reset. If software does not service it within the watchdog timeout period, WDT1 resets the entire system. Because this bare-metal OS does not implement a watchdog service loop, the watchdog must be disabled at boot before any other initialization.
+
+<Warning>
+`watchdog_disable()` must be the first call in `main()`, before any other hardware initialization. If any earlier code takes too long — including UART setup or process initialization — WDT1 may fire and reset the board before the OS starts.
+</Warning>
+
+## Register map
+
+```c
+#define WDT1_BASE  0x44E35000
+
+#define WDT_WSPR  (WDT1_BASE + 0x48)  // Watchdog Start/Stop Register
+#define WDT_WWPS  (WDT1_BASE + 0x34)  // Watchdog Write Pending Status
+```
+
+`WDT_WSPR` accepts a two-step magic sequence to disable the watchdog. `WDT_WWPS` bit 4 (`W_PEND_WSPR`) indicates that a previous write to `WDT_WSPR` is still pending in the synchronizer; software must poll it to zero before issuing the next write.
+
+## watchdog_disable
+
+```c
+void watchdog_disable(void);
+```
+
+Sends the disable sequence to WDT1. On QEMU (`PLATFORM_TARGET == 1`) this function is a no-op — QEMU's `versatilepb` model does not emulate WDT1, so the writes are unnecessary and omitted via a preprocessor guard.
+
+### Disable sequence
+
+<Steps>
+  <Step title="Write 0xAAAA to WDT_WSPR">
+    The first magic word begins the disable handshake.
+
+    ```c
+    PUT32(WDT_WSPR, 0xAAAA);
+    ```
+  </Step>
+  <Step title="Poll WDT_WWPS until bit 4 clears">
+    Wait for the synchronizer to absorb the first write before proceeding.
+
+    ```c
+    while (GET32(WDT_WWPS) & (1 << 4));
+    ```
+  </Step>
+  <Step title="Write 0x5555 to WDT_WSPR">
+    The second magic word completes the disable handshake and stops the watchdog.
+
+    ```c
+    PUT32(WDT_WSPR, 0x5555);
+    ```
+  </Step>
+  <Step title="Poll WDT_WWPS until bit 4 clears">
+    Wait for the synchronizer to absorb the second write. After this poll returns, WDT1 is stopped.
+
+    ```c
+    while (GET32(WDT_WWPS) & (1 << 4));
+    ```
+  </Step>
+</Steps>
+
+### Implementation
+
+```c
+void watchdog_disable(void) {
+#if PLATFORM_TARGET == 0
+    PUT32(WDT_WSPR, 0xAAAA);
+    while (GET32(WDT_WWPS) & (1 << 4));
+    PUT32(WDT_WSPR, 0x5555);
+    while (GET32(WDT_WWPS) & (1 << 4));
+#endif
+}
+```
+
+<Note>
+On QEMU (`PLATFORM_TARGET == 1`), the `#if` guard makes `watchdog_disable()` an empty function. The call site in `main()` remains the same for both targets, so no platform-specific code is needed in user or OS startup code.
+</Note>

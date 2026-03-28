@@ -1,0 +1,59 @@
+---
+title: "string — string utilities"
+description: "Basic string operations for bare-metal environments"
+---
+
+`string` provides a minimal set of string utilities for bare-metal use. It is compiled with `-nostdlib` and therefore cannot include the standard `<string.h>`. Only the operations actually required by the OS are implemented.
+
+<Note>
+This library does not expose `strlen`, `strcpy`, `strcmp`, `memset`, or `memcpy`. The sole function is `my_strncpy`, which covers the one safe-copy use case needed in the project.
+</Note>
+
+## my_strncpy
+
+```c
+char *my_strncpy(char *dest, const char *src, size_t n);
+```
+
+Copies at most `n` characters from `src` into `dest`. If `src` is shorter than `n` characters, the remainder of `dest` is filled with null bytes. The destination is always null-padded up to `n` bytes, but it is **not** guaranteed to be null-terminated when `src` is exactly `n` characters long.
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `dest` | `char *` | Destination buffer. Must have room for at least `n` bytes. |
+| `src` | `const char *` | Source string to copy from. |
+| `n` | `size_t` | Maximum number of characters to copy. |
+
+### Return value
+
+Returns `dest`.
+
+### Implementation
+
+```c
+char *my_strncpy(char *dest, const char *src, size_t n) {
+    size_t i;
+    for(i = 0; i < n && src[i] != '\0'; i++) {
+        dest[i] = src[i];
+    }
+    for(; i < n; i++) {
+        dest[i] = '\0';
+    }
+    return dest;
+}
+```
+
+### Usage example
+
+```c
+#include "string.h"
+
+char buf[16];
+my_strncpy(buf, "hello", sizeof(buf));
+// buf == "hello\0\0\0\0\0\0\0\0\0\0\0"
+```
+
+<Warning>
+If `src` is exactly `n` characters long with no null terminator, `dest` will not be null-terminated. Always ensure the destination buffer is at least `n + 1` bytes when treating the result as a C string, or keep `src` shorter than `n`.
+</Warning>

@@ -1,0 +1,146 @@
+---
+title: "Timer driver"
+description: "Hardware timer initialization and IRQ handling for BeagleBone Black and QEMU"
+---
+
+The timer driver configures a hardware periodic timer that fires an IRQ at regular intervals. The IRQ handler calls the OS scheduler (`schedule()`), which is the sole preemption mechanism for user processes.
+
+The driver is compiled for one of two targets, selected at build time via `PLATFORM_TARGET`:
+
+| `PLATFORM_TARGET` | Hardware | Timer peripheral |
+|-------------------|----------|-----------------|
+| `0` (default) | BeagleBone Black | DMTIMER2 at 24 MHz |
+| `1` | QEMU (`versatilepb`) | SP804 dual timer |
+
+## Register definitions
+
+<Tabs>
+  <Tab title="BeagleBone Black">
+
+```c
+// DMTIMER2 registers
+#define TCLR   (DMTIMER2_BASE + 0x38)  // Timer Control Register
+#define TCRR   (DMTIMER2_BASE + 0x3C)  // Timer Counter Register
+#define TISR   (DMTIMER2_BASE + 0x28)  // Timer Interrupt Status Register
+#define TIER   (DMTIMER2_BASE + 0x2C)  // Timer Interrupt Enable Register
+#define TLDR   (DMTIMER2_BASE + 0x40)  // Timer Load Register
+
+// Interrupt Controller (INTCPS)
+#define INTC_MIR_CLEAR2  (INTCPS_BASE + 0xC8)   // Interrupt Mask Clear Register 2
+#define INTC_CONTROL     (INTCPS_BASE + 0x48)   // Interrupt Controller Control
+#define INTC_ILR68       (INTCPS_BASE + 0x110)  // Interrupt Line Register 68 (DMTIMER2)
+
+// Clock Manager
+#define CM_PER_TIMER2_CLKCTRL  (CM_PER_BASE + 0x80)  // Timer2 Clock Control
+
+// Overflow period: ~2 seconds at 24 MHz
+#define FREQ_BEAGLE  (0xFFFFFFFF - (24000000 * 2))
+```
+
+  </Tab>
+  <Tab title="QEMU (SP804)">
+
+```c
+// SP804 registers (at PLATFORM_TIMER_BASE)
+// offset 0x00 — Load register
+// offset 0x08 — Control register
+// offset 0x0C — Interrupt clear register
+
+// VIC (at PLATFORM_INTC_BASE)
+// offset 0x10 — Enable register
+
+#define FREQ_QEMU  (1 * 1000000)  // 1 MHz interval
+```
+
+  </Tab>
+</Tabs>
+
+## timer_init
+
+```c
+void timer_init(void);
+```
+
+Configures the hardware timer for periodic overflow interrupts and enables the IRQ line in the interrupt controller.
+
+<Steps>
+  <Step title="BeagleBone Black path">
+    1. Enable the DMTIMER2 functional clock via `CM_PER_TIMER2_CLKCTRL` (write `0x2`).
+    2. Unmask interrupt line 68 in INTCPS by writing `(1 << 4)` to `INTC_MIR_CLEAR2`. Set its priority to 0 via `INTC_ILR68`.
+    3. Stop the timer (`TCLR = 0x0`) and clear any pending interrupt flags (`TISR = 0x7`).
+    4. Write `FREQ_BEAGLE` to both `TLDR` (auto-reload value) and `TCRR` (current count), producing an overflow period of approximately 2 seconds at 24 MHz.
+    5. Enable the overflow interrupt (`TIER = 0x2`) and start the timer with auto-reload (`TCLR = 0x3`).
+  </Step>
+  <Step title="QEMU path">
+    1. Stop the SP804 timer (write `0` to control register offset `0x08`).
+    2. Load `FREQ_QEMU` (1 000 000) into the load register (offset `0x00`).
+    3. Clear any pending interrupt (write `1` to offset `0x0C`).
+    4. Enable the SP804 IRQ line in the VIC (write `(1 << 4)` to `PLATFORM_INTC_BASE + 0x10`).
+    5. Start the timer in periodic mode with IRQ enabled (write `0xE2` to offset `0x08`).
+  </Step>
+</Steps>
+
+### Implementation
+
+```c
+void timer_init(void) {
+#if PLATFORM_TARGET == 1
+    PUT32(PLATFORM_TIMER_BASE + 0x08, 0);
+    PUT32(PLATFORM_TIMER_BASE + 0x00, FREQ_QEMU);
+    PUT32(PLATFORM_TIMER_BASE + 0x0C, 1);
+    PUT32(PLATFORM_INTC_BASE + 0x10, (1 << 4));
+    PUT32(PLATFORM_TIMER_BASE + 0x08, 0xE2);
+#else
+    PUT32(CM_PER_TIMER2_CLKCTRL, 0x2);
+
+    PUT32(INTC_MIR_CLEAR2, (1 << 4));
+    PUT32(INTC_ILR68, 0x0);
+
+    PUT32(TCLR, 0x0);
+    PUT32(TISR, 0x7);
+
+    PUT32(TLDR, FREQ_BEAGLE);
+    PUT32(TCRR, FREQ_BEAGLE);
+
+    PUT32(TIER, 0x2);
+    PUT32(TCLR, 0x3);
+#endif
+}
+```
+
+<Note>
+`timer_init()` must be called after process initialization but before `enable_irq()`. Enabling the IRQ before the timer is configured will cause the first timer interrupt to fire into an unprepared handler.
+</Note>
+
+## timer_irq_handler
+
+```c
+void timer_irq_handler(void);
+```
+
+Called from the assembly IRQ entry point in `root.s` when the timer interrupt fires. Clears the hardware interrupt flags so the timer can fire again, then returns to the assembly wrapper which calls `schedule()`.
+
+### Implementation
+
+```c
+void timer_irq_handler(void) {
+#if PLATFORM_TARGET == 1
+    PUT32(PLATFORM_TIMER_BASE + 0x0C, 1);  // clear SP804 interrupt
+    PUT32(PLATFORM_INTC_BASE + 0x30, 1);   // acknowledge VIC
+#else
+    PUT32(TISR, 0x2);       // clear overflow flag (bit 1)
+    PUT32(INTC_CONTROL, 0x1); // acknowledge INTCPS
+#endif
+}
+```
+
+## IRQ call chain
+
+```
+Timer overflow
+    └─► irq_handler (root.s)
+            └─► timer_irq_handler()   ← clears hardware flags
+            └─► schedule()            ← selects next process
+```
+
+The assembly `irq_handler` in `root.s` saves the interrupted process context, calls `timer_irq_handler` to clear the interrupt, then calls `schedule` to perform a context switch if needed.

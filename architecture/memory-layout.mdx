@@ -1,0 +1,292 @@
+---
+title: "Memory layout"
+description: "How RAM is partitioned between the OS and user processes using linker scripts"
+---
+
+Proyecto1cc7 uses two linker scripts — one for BeagleBone Black and one for QEMU — to partition physical RAM into non-overlapping regions for the OS and each user process. There is no dynamic memory allocation and no MMU; all boundaries are fixed at link time.
+
+## Linker scripts
+
+| File | Target | Invoked with |
+|---|---|---|
+| `linker/linker_beagle.ld` | BeagleBone Black (AM335x) | `make TARGET=beagle` |
+| `linker/linker_qemu.ld` | QEMU versatilepb | `make TARGET=qemu` |
+
+The active script is selected by the Makefile:
+
+```makefile
+ifeq ($(TARGET), qemu)
+    LDFLAGS = -T linker/linker_qemu.ld
+else
+    LDFLAGS = -T linker/linker_beagle.ld
+endif
+```
+
+## Memory maps
+
+### BeagleBone Black
+
+The BeagleBone starts code at `0x82000000`, which is the beginning of the DDR3 SDRAM region reachable after the ROM bootloader loads the image.
+
+| Region | Origin | Length | Contents |
+|---|---|---|---|
+| `os_ram` | `0x82000000` | 256 KB | `.text`, `.rodata`, `.data`, `.bss`, IRQ stack, SVC stack top |
+| `p1_ram` | `0x82100000` | 64 KB | `.p1_text`, `.p1_rodata`, `.p1_data`, `.p1_bss` |
+| `p1_stack` | `0x82110000` | 4 KB | P1 SVC stack (grows down from `0x82111000`) |
+| `p2_ram` | `0x82200000` | 64 KB | `.p2_text`, `.p2_rodata`, `.p2_data`, `.p2_bss` |
+| `p2_stack` | `0x82210000` | 4 KB | P2 SVC stack (grows down from `0x82211000`) |
+
+```
+0x82000000  ┌───────────────────────────────┐
+            │  OS .text / .rodata           │  OS code & constants
+            │  OS .data                     │  Initialized globals
+            │  OS .bss  (+ IRQ stack 4K)    │  Zero-initialized + IRQ stack
+            │  OS SVC stack (top→0x82040000)│  OS main-loop stack
+0x82040000  └───────────────────────────────┘  (end of 256K os_ram)
+
+0x82100000  ┌───────────────────────────────┐
+            │  P1 .p1_text / data / bss     │  User process 1 image
+0x82110000  ├───────────────────────────────┤
+            │  P1 stack (4K)                │  Grows down from 0x82111000
+0x82111000  └───────────────────────────────┘
+
+0x82200000  ┌───────────────────────────────┐
+            │  P2 .p2_text / data / bss     │  User process 2 image
+0x82210000  ├───────────────────────────────┤
+            │  P2 stack (4K)                │  Grows down from 0x82211000
+0x82211000  └───────────────────────────────┘
+```
+
+### QEMU (versatilepb)
+
+QEMU loads the ELF at the physical address specified in its `.text` section. The versatilepb RAM starts at `0x00000000`; the OS is placed at `0x00010000` to leave room below for the QEMU ROM.
+
+| Region | Origin | Length | Contents |
+|---|---|---|---|
+| `os_ram` | `0x00010000` | 64 KB | `.text`, `.rodata`, `.data`, `.bss`, IRQ stack, SVC stack top |
+| `p1_ram` | `0x00060000` | 64 KB | P1 code, data, bss |
+| `p1_stack` | `0x00070000` | 4 KB | P1 SVC stack (grows down from `0x00071000`) |
+| `p2_ram` | `0x00080000` | 64 KB | P2 code, data, bss |
+| `p2_stack` | `0x00090000` | 4 KB | P2 SVC stack (grows down from `0x00091000`) |
+
+```
+0x00010000  ┌───────────────────────────────┐
+            │  OS .text (vector_table first) │
+            │  OS .data / .bss              │
+            │  IRQ stack (4K, in .bss)      │
+            │  SVC stack (top→0x00020000)   │
+0x00020000  └───────────────────────────────┘  (end of 64K os_ram)
+
+0x00060000  ┌───────────────────────────────┐
+            │  P1 .p1_text / .p1_bss        │
+0x00070000  ├───────────────────────────────┤
+            │  P1 stack (4K)                │
+0x00071000  └───────────────────────────────┘
+
+0x00080000  ┌───────────────────────────────┐
+            │  P2 .p2_text / .p2_bss        │
+0x00090000  ├───────────────────────────────┤
+            │  P2 stack (4K)                │
+0x00091000  └───────────────────────────────┘
+```
+
+<Note>
+The QEMU `os_ram` region is 64 KB compared to 256 KB on BeagleBone. This is intentional — QEMU builds use `-O0 -g3` for debugging, so the image is larger, but the OS region is kept small to expose any overflow early.
+</Note>
+
+## Linker sections explained
+
+### OS sections
+
+The OS sections follow the standard C layout and are placed entirely in `os_ram`:
+
+```ld
+.text :
+{
+    *(.text*)
+    *(.rodata*)
+} > os_ram
+
+.data : AT(ADDR(.text) + SIZEOF(.text))
+{
+    __data_start__ = .;
+    *(.data*)
+    __data_end__ = .;
+} > os_ram
+
+.bss :
+{
+    __bss_start__ = .;
+    *(.bss*)
+    *(COMMON)
+    __bss_end__ = .;
+} > os_ram
+```
+
+The SVC stack top for the OS is derived from the end of `os_ram`:
+
+```ld
+_stack_bottom = __bss_end__;
+_stack_top    = ORIGIN(os_ram) + LENGTH(os_ram);
+```
+
+`_stack_top` is loaded into `sp` during boot in `root.s` when entering SVC mode.
+
+### User process sections (BeagleBone)
+
+User process code must be placed into named sections (`__attribute__((section(".p1_text")))`) so the linker can route them to the correct RAM region. `KEEP()` prevents dead-code elimination from removing them even if the OS does not reference them by symbol:
+
+```ld
+.p1_text :
+{
+    __p1_start__ = .;
+    KEEP(*(.p1_text))
+    KEEP(*(.p1_rodata))
+    KEEP(*(.p1_data))
+    KEEP(*(.p1_bss))
+    __p1_end__ = .;
+} > p1_ram
+
+__p1_stack_base__ = ORIGIN(p1_stack);
+__p1_stack_top__  = ORIGIN(p1_stack) + LENGTH(p1_stack);
+```
+
+The same pattern is repeated for `.p2_text` in `p2_ram`.
+
+### User process sections (QEMU)
+
+The QEMU linker script uses a slightly different style, separating bss explicitly and omitting `KEEP()`:
+
+```ld
+.p1_text :
+{
+    *(.p1_text*)
+    *(.p1_rodata*)
+} > p1_ram
+
+.p1_bss :
+{
+    *p1*(.bss*)
+} > p1_ram
+
+__p1_stack_base__ = ORIGIN(p1_stack);
+__p1_stack_top__  = ORIGIN(p1_stack) + LENGTH(p1_stack);
+```
+
+The same pattern repeats for `.p2_text` / `.p2_bss` in `p2_ram`.
+
+<Warning>
+The QEMU script does not use `KEEP()` for user process sections. If a p1/p2 translation unit contains no symbols referenced from `root.s` or `os.c`, the linker may silently discard it. The BeagleBone script is safer in this regard.
+</Warning>
+
+### IRQ stack
+
+The 4096-byte IRQ stack is declared directly in `root.s` inside a `.bss` section:
+
+```armasm
+.section .bss
+.align 8
+
+irq_stack:
+    .space 4096
+_irq_stack_top:
+```
+
+`_irq_stack_top` is the label at the top of this space. During `_start`, the processor enters IRQ mode and loads this symbol into `sp`:
+
+```armasm
+orr r1, r1, #0x12      @ IRQ mode
+msr cpsr_c, r1
+ldr sp, =_irq_stack_top
+```
+
+On the **BeagleBone** linker script, this `.bss` content is collected into the OS `.bss` section inside `os_ram`.
+
+On the **QEMU** linker script, the `.irq_stack` input section is routed to a dedicated output section placed after `.bss`, still within `os_ram`, and aligned to 8 bytes:
+
+```ld
+.irq_stack :
+{
+    . = ALIGN(8);
+    *(.irq_stack)
+} > os_ram
+```
+
+In both cases `_irq_stack_top` resolves to an address inside `os_ram` and is loaded into `sp_irq` during `_start`.
+
+## How `.venv` files supply addresses
+
+The two `.venv` files export shell variables that the Makefile reads with `include`:
+
+```makefile
+ifeq ($(TARGET), qemu)
+    include $(OS_DIR)/.venv.qemu
+else
+    include $(OS_DIR)/.venv.beagle
+endif
+```
+
+Every address is then passed to the compiler as a `-D` flag via `PLATFORM_FLAGS`:
+
+```makefile
+PLATFORM_FLAGS = \
+    -DPLATFORM_TARGET=$(PLATFORM_TARGET)      \
+    -DPLATFORM_UART0_BASE=$(UART0_BASE)        \
+    -DPLATFORM_TIMER_BASE=$(TIMER_BASE)        \
+    -DPLATFORM_INTC_BASE=$(INTC_BASE)          \
+    -DPLATFORM_CM_PER_BASE=$(CM_PER_BASE)      \
+    -DPLATFORM_OS_BASE=$(OS_BASE)              \
+    -DPLATFORM_OS_STACK=$(OS_STACK)            \
+    -DP1_BASE=$(P1_BASE)                       \
+    -DP1_STACK=$(P1_STACK)                     \
+    -DP2_BASE=$(P2_BASE)                       \
+    -DP2_STACK=$(P2_STACK)
+```
+
+`plataform.h` validates that the required defines are present at compile time:
+
+```c
+#ifndef PLATFORM_UART0_BASE
+#error "PLATFORM_UART0_BASE no definido"
+#endif
+```
+
+`os.c` then uses `PLATFORM_OS_BASE`, `P1_BASE`, `P2_BASE`, etc. directly as process entry points and initial stack pointers:
+
+```c
+process_init(&p0, 0, PLATFORM_OS_BASE, PLATFORM_OS_STACK + PROCESS_STACK_SIZE);
+process_init(&p1, 1, P1_BASE,          P1_STACK          + PROCESS_STACK_SIZE);
+process_init(&p2, 2, P2_BASE,          P2_STACK          + PROCESS_STACK_SIZE);
+```
+
+## Full address reference
+
+### BeagleBone Black (from `.venv.beagle`)
+
+| Define | Value | Purpose |
+|---|---|---|
+| `OS_BASE` | `0x82000000` | OS entry point / `_start` |
+| `OS_STACK` | `0x82010000` | OS SVC stack base (top = base + 0x1000) |
+| `P1_BASE` | `0x82100000` | P1 entry point |
+| `P1_STACK` | `0x82110000` | P1 SVC stack base |
+| `P2_BASE` | `0x82200000` | P2 entry point |
+| `P2_STACK` | `0x82210000` | P2 SVC stack base |
+| `UART0_BASE` | `0x44E09000` | UART0 MMIO |
+| `TIMER_BASE` | `0x48040000` | DMTimer2 MMIO |
+| `INTC_BASE` | `0x48200000` | Interrupt controller MMIO |
+| `CM_PER_BASE` | `0x44E00000` | Clock module MMIO |
+
+### QEMU (from `.venv.qemu`)
+
+| Define | Value | Purpose |
+|---|---|---|
+| `OS_BASE` | `0x00010000` | OS entry point / `_start` |
+| `OS_STACK` | `0x00020000` | OS SVC stack base (top = base + 0x1000) |
+| `P1_BASE` | `0x00060000` | P1 entry point |
+| `P1_STACK` | `0x00070000` | P1 SVC stack base |
+| `P2_BASE` | `0x00080000` | P2 entry point |
+| `P2_STACK` | `0x00090000` | P2 SVC stack base |
+| `UART0_BASE` | `0x101f1000` | PL011 UART MMIO |
+| `TIMER_BASE` | `0x101e2000` | SP804 timer MMIO |
+| `INTC_BASE` | `0x10140000` | PL190 VIC MMIO |
+| `CM_PER_BASE` | `0x00000000` | Unused on QEMU |

@@ -1,0 +1,77 @@
+---
+title: "rand — pseudo-random number generator"
+description: "A simple linear congruential generator for bare-metal use"
+---
+
+`rand` provides a minimal pseudo-random number generator (PRNG) without any libc dependency. It uses a linear congruential algorithm with a fixed multiplier and increment — the same approach used by many C standard library implementations.
+
+## Functions
+
+### srand_custom
+
+```c
+void srand_custom(unsigned int new_seed);
+```
+
+Seeds the PRNG with the given value. The default seed is `12345`. Call this before the first `rand_custom()` if a different starting sequence is needed.
+
+```c
+srand_custom(42);
+```
+
+<Note>
+There is no hardware entropy source on this bare-metal OS. If you need different sequences across boots, seed with a value derived from observable state (e.g. a timer counter read immediately before enabling IRQs).
+</Note>
+
+---
+
+### rand_custom
+
+```c
+unsigned int rand_custom(void);
+```
+
+Returns the next pseudo-random unsigned integer in the sequence. The generator uses the linear congruential formula:
+
+```
+seed = seed × 1103515245 + 12345
+return (seed / 65536) % 32768
+```
+
+The output range is `[0, 32767]`, matching the range of `rand()` in a standard C library.
+
+```c
+unsigned int r = rand_custom();   // 0 <= r <= 32767
+```
+
+### Implementation
+
+```c rand.c
+static unsigned int seed = 12345;
+
+void srand_custom(unsigned int new_seed) {
+    seed = new_seed;
+}
+
+unsigned int rand_custom(void) {
+    seed = seed * 1103515245 + 12345;
+    return (seed / 65536) % 32768;
+}
+```
+
+<Warning>
+The LCG parameters produce a period of 2³² iterations before the sequence repeats. The output passes basic statistical tests but is **not** cryptographically secure. Do not use it for security-sensitive purposes.
+</Warning>
+
+## Usage example
+
+```c
+#include "rand.h"
+
+srand_custom(1);
+
+for (int i = 0; i < 5; i++) {
+    unsigned int r = rand_custom();
+    PRINT("%d\n", (int)r);
+}
+```

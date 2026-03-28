@@ -1,0 +1,215 @@
+---
+title: "Interrupts and the vector table"
+description: "ARM interrupt vectors, IRQ handler, and the timer-driven scheduling loop"
+---
+
+The OS is entirely event-driven at the hardware level. A periodic timer fires an IRQ on every tick, which is the sole mechanism that preempts the running process and invokes the scheduler.
+
+## ARM exception vector table
+
+The vector table is placed at the start of `.text` and aligned to a 32-byte boundary. Each entry is a 32-bit branch instruction that redirects the processor to the appropriate handler:
+
+```armasm root.s
+.align 5
+vector_table:
+    b _start              @ 0x00 Reset
+    b undefined_handler   @ 0x04 Undefined instruction
+    b swi_handler         @ 0x08 Software interrupt (SWI)
+    b prefetch_handler    @ 0x0C Prefetch abort
+    b data_handler        @ 0x10 Data abort
+    b .                   @ 0x14 Reserved (infinite loop)
+    b irq_handler         @ 0x18 IRQ
+    b fiq_handler         @ 0x1C FIQ
+```
+
+| Offset | Vector | Handler | Notes |
+|---|---|---|---|
+| `0x00` | Reset | `_start` | Boot entry point |
+| `0x04` | Undefined instruction | `hang` | Fatal — loops forever |
+| `0x08` | SWI | `hang` | Not used by this OS |
+| `0x0C` | Prefetch abort | `hang` | Fatal |
+| `0x10` | Data abort | `hang` | Fatal |
+| `0x14` | Reserved | `.` (self-loop) | Should never execute |
+| `0x18` | IRQ | `irq_handler` | Timer-driven scheduler entry |
+| `0x1C` | FIQ | `hang` | Not used |
+
+<Note>
+  `hang` is a simple infinite loop (`b hang`). Any unexpected exception causes the system to halt rather than exhibit undefined behaviour.
+</Note>
+
+## VBAR setup
+
+The vector table is registered with the processor at boot via the Vector Base Address Register (VBAR):
+
+```armasm root.s
+_start:
+    ldr r0, =vector_table
+    mcr p15, 0, r0, c12, c0, 0
+```
+
+`MCR p15, 0, r0, c12, c0, 0` writes `r0` into CP15 register `c12` (VBAR). After this instruction, all exceptions are dispatched through `vector_table` regardless of where it is located in memory.
+
+## IRQ and FIQ stack setup
+
+Immediately after VBAR, `_start` configures separate stacks for IRQ and SVC modes:
+
+```armasm root.s
+    mrs r0, cpsr
+    bic r1, r0, #0x1F
+    orr r1, r1, #0x12      @ IRQ mode (0x12)
+    orr r1, r1, #0x80      @ IRQ disabled
+    msr cpsr_c, r1
+
+    ldr sp, =_irq_stack_top     @ 4 KiB IRQ stack
+
+    bic r1, r0, #0x1F
+    orr r1, r1, #0x13      @ SVC mode (0x13)
+    orr r1, r1, #0x80      @ IRQ disabled
+    msr cpsr_c, r1
+
+    ldr sp, =_stack_top         @ SVC stack
+
+    bl main
+```
+
+The IRQ stack is a 4 KiB `.bss` region:
+
+```armasm root.s
+.section .bss
+.align 8
+irq_stack:
+    .space 4096
+_irq_stack_top:
+```
+
+## enable_irq / disable_irq
+
+IRQs are controlled by bit 7 of the CPSR (the **I** bit). When set, IRQs are masked; when clear, they are enabled.
+
+```armasm root.s
+enable_irq:
+    mrs r0, cpsr
+    bic r0, r0, #0x80    @ clear bit 7
+    msr cpsr_c, r0
+    bx  lr
+
+disable_irq:
+    mrs r0, cpsr
+    orr r0, r0, #0x80    @ set bit 7
+    msr cpsr_c, r0
+    bx  lr
+```
+
+These are declared in `os.h` and called from C:
+
+```c os.h
+void enable_irq(void);
+void disable_irq(void);
+```
+
+## Timer configuration
+
+`timer_init()` in `timer.c` programs the hardware timer and its interrupt controller to fire periodic IRQs.
+
+<Tabs>
+  <Tab title="QEMU (SP804)">
+
+```c timer.c
+#define FREQ_QEMU  1 * 1000000
+
+void timer_init(void) {
+    PUT32(PLATFORM_TIMER_BASE + 0x08, 0);           // stop timer
+    PUT32(PLATFORM_TIMER_BASE + 0x00, FREQ_QEMU);   // load value
+    PUT32(PLATFORM_TIMER_BASE + 0x0C, 1);           // clear interrupt
+    PUT32(PLATFORM_INTC_BASE  + 0x10, (1 << 4));    // unmask in VIC
+    PUT32(PLATFORM_TIMER_BASE + 0x08, 0xE2);        // enable + periodic + IRQ
+}
+```
+
+`0xE2` enables the timer in 32-bit periodic mode with interrupt generation enabled.
+
+  </Tab>
+  <Tab title="BeagleBone (DMTIMER2)">
+
+```c timer.c
+#define FREQ_BEAGLE  0xFFFFFFFF - (24000000 * 2)
+
+void timer_init(void) {
+    PUT32(CM_PER_TIMER2_CLKCTRL, 0x2);   // enable timer2 clock
+    PUT32(INTC_MIR_CLEAR2, (1 << 4));    // unmask interrupt 68
+    PUT32(INTC_ILR68, 0x0);              // set priority
+
+    PUT32(TCLR, 0x0);                    // stop timer
+    PUT32(TISR, 0x7);                    // clear pending flags
+
+    PUT32(TLDR, FREQ_BEAGLE);            // load value (~2 s at 24 MHz)
+    PUT32(TCRR, FREQ_BEAGLE);
+
+    PUT32(TIER, 0x2);                    // enable overflow interrupt
+    PUT32(TCLR, 0x3);                    // start + auto-reload
+}
+```
+
+  </Tab>
+</Tabs>
+
+### Timer IRQ handler
+
+When the timer fires, the interrupt is cleared and the interrupt controller is acknowledged before `schedule()` runs:
+
+<Tabs>
+  <Tab title="QEMU (SP804)">
+
+```c timer.c
+void timer_irq_handler(void) {
+    PUT32(PLATFORM_TIMER_BASE + 0x0C, 1);  // clear SP804 interrupt
+    PUT32(PLATFORM_INTC_BASE  + 0x30, 1);  // acknowledge VIC
+}
+```
+
+  </Tab>
+  <Tab title="BeagleBone (DMTIMER2)">
+
+```c timer.c
+void timer_irq_handler(void) {
+    PUT32(TISR, 0x2);         // clear timer overflow flag
+    PUT32(INTC_CONTROL, 0x1); // acknowledge interrupt controller
+}
+```
+
+  </Tab>
+</Tabs>
+
+## Critical sections in user processes
+
+User processes call `disable_irq()` before any output and `enable_irq()` after to prevent the scheduler from preempting mid-print:
+
+```c os.c
+while (1) {
+    disable_irq();
+    PRINT("----From OS: hola\n");
+    enable_irq();
+}
+```
+
+<Warning>
+  If `enable_irq()` is never called after `disable_irq()`, no further context switches will occur and the system will be stuck in the process that last disabled interrupts.
+</Warning>
+
+## ARM IRQ pipeline: the PC + 4 offset
+
+When the ARM processor takes an IRQ, it sets:
+
+```
+lr_irq = PC_interrupted + 4
+```
+
+This is a consequence of the 3-stage fetch/decode/execute pipeline — the processor has already fetched one instruction past the instruction that was executing. To resume the interrupted instruction, the IRQ handler must subtract 4 before storing the PC in the PCB:
+
+```armasm root.s
+ldr  r5, [sp, #52]    @ lr_irq saved at handler entry
+sub  r5, r5, #4       @ adjust for pipeline
+str  r5, [r4, #PROC_PC]
+```
+
+Without this adjustment the process would resume one instruction too late, skipping the instruction that was in flight when the IRQ fired.
